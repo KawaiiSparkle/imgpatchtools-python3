@@ -90,7 +90,7 @@ def apply_bsdiff_patch(source_data: bytes, patch_data: bytes) -> bytes:
         raise RuntimeError("bsdiff4 module is required but not available. Install with: pip install bsdiff4")
     
 def apply_imgdiff_patch(source_data: bytes, patch_data: bytes, bonus_data: bytes = None) -> bytes:  
-    """Apply ImgDiff patch - full implementation based on C++ code"""  
+    """Apply ImgDiff patch with proper integer range handling"""  
       
     if len(patch_data) < 12:  
         raise ValueError("Patch too short to contain header")  
@@ -111,7 +111,7 @@ def apply_imgdiff_patch(source_data: bytes, patch_data: bytes, bonus_data: bytes
         pos += 4  
           
         if chunk_type == CHUNK_NORMAL:  
-            # Normal chunk - apply BSDiff patch  
+            # 添加范围检查  
             if pos + 24 > len(patch_data):  
                 raise ValueError(f"Failed to read chunk {chunk_idx} normal header")  
               
@@ -120,88 +120,22 @@ def apply_imgdiff_patch(source_data: bytes, patch_data: bytes, bonus_data: bytes
             patch_offset = read_le_int64(patch_data, pos + 16)  
             pos += 24  
               
-            if src_start + src_len > len(source_data):  
-                raise ValueError("Source data too short")  
+            # 检查值是否在合理范围内  
+            if src_start > len(source_data) or src_len > len(source_data):  
+                raise ValueError(f"Source parameters out of range: start={src_start}, len={src_len}")  
               
-            chunk_source = source_data[src_start:src_start + src_len]  
-            chunk_patch = patch_data[patch_offset:]  
+            if patch_offset > len(patch_data):  
+                raise ValueError(f"Patch offset out of range: {patch_offset}")  
               
-            patched_chunk = apply_bsdiff_patch(chunk_source, chunk_patch)  
-            output_data.extend(patched_chunk)  
-              
-        elif chunk_type == CHUNK_RAW:  
-            # Raw chunk - copy data directly  
-            if pos + 4 > len(patch_data):  
-                raise ValueError(f"Failed to read chunk {chunk_idx} raw header")  
-              
-            data_len = read_le_int32(patch_data, pos)  
-            pos += 4  
-              
-            if pos + data_len > len(patch_data):  
-                raise ValueError("Raw chunk data truncated")  
-              
-            output_data.extend(patch_data[pos:pos + data_len])  
-            pos += data_len  
-              
-        elif chunk_type == CHUNK_DEFLATE:  
-            # Deflate chunk - decompress, patch, recompress [3](#2-2)   
-              
-            if pos + 60 > len(patch_data):  
-                raise ValueError(f"Failed to read chunk {chunk_idx} deflate header")  
-              
-            src_start = read_le_int64(patch_data, pos)  
-            src_len = read_le_int64(patch_data, pos + 8)  
-            patch_offset = read_le_int64(patch_data, pos + 16)  
-            expanded_len = read_le_int64(patch_data, pos + 24)  
-            target_len = read_le_int64(patch_data, pos + 32)  
-              
-            # Deflate parameters  
-            level = read_le_int32(patch_data, pos + 40)  
-            method = read_le_int32(patch_data, pos + 44)  
-            window_bits = read_le_int32(patch_data, pos + 48)  
-            mem_level = read_le_int32(patch_data, pos + 52)  
-            strategy = read_le_int32(patch_data, pos + 56)  
-            pos += 60  
-              
-            if src_start + src_len > len(source_data):  
-                raise ValueError("Source data too short for deflate chunk")  
-              
-            # Decompress source data  
-            compressed_source = source_data[src_start:src_start + src_len]  
+            # 确保切片操作安全  
             try:  
-                expanded_source = zlib.decompress(compressed_source, -window_bits)  
-            except zlib.error as e:  
-                raise ValueError(f"Failed to decompress source: {e}")  
-              
-            # Add bonus data if needed  
-            if bonus_data and expanded_len > len(expanded_source):  
-                bonus_size = expanded_len - len(expanded_source)  
-                if bonus_size <= len(bonus_data):  
-                    expanded_source += bonus_data[:bonus_size]  
-              
-            # Apply BSDiff patch to uncompressed data  
-            chunk_patch = patch_data[patch_offset:]  
-            patched_uncompressed = apply_bsdiff_patch(expanded_source, chunk_patch)  
-              
-            # Recompress with same parameters  
-            try:  
-                compressor = zlib.compressobj(  
-                    level=level,  
-                    method=method,  
-                    wbits=-window_bits,  
-                    memLevel=mem_level,  
-                    strategy=strategy  
-                )  
-                compressed_output = compressor.compress(patched_uncompressed)  
-                compressed_output += compressor.flush()  
-                output_data.extend(compressed_output)  
-            except zlib.error as e:  
-                raise ValueError(f"Failed to recompress data: {e}")  
-                  
-        else:  
-            raise ValueError(f"Unknown chunk type {chunk_type} in chunk {chunk_idx}")  
-      
-    return bytes(output_data)  
+                chunk_source = source_data[src_start:src_start + src_len]  
+                chunk_patch = patch_data[patch_offset:]  
+                patched_chunk = apply_bsdiff_patch(chunk_source, chunk_patch)  
+                output_data.extend(patched_chunk)  
+            except OverflowError as e:  
+                raise ValueError(f"Integer overflow in chunk {chunk_idx}: {e}")
+
 def generate_target(source_file: FileContents, patch_data: bytes,   
                    target_filename: str, target_sha1: bytes,   
                    target_size: int, bonus_data: bytes = None) -> bool:  

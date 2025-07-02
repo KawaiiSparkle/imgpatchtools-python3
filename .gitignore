@@ -1,4 +1,6 @@
-vendor.transfer.list
-vendor.new.dat
-vendor.patch.dat
-vendor.img
+*.br
+*.list
+*.dat
+*.img
+*.pyc
+*.bat
