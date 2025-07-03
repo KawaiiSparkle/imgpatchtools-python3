@@ -14,6 +14,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor  
 import mmap  
 from pathlib import Path  
+import BlockImageUpdate
   
 class FileContents:  
     """Represents file contents with SHA1 hash and metadata"""  
@@ -114,7 +115,7 @@ def apply_bsdiff_patch(source_data: bytes, patch_data: bytes) -> bytes:
         raise RuntimeError("bsdiff4 module is required but not available. Install with: pip install bsdiff4")  
   
 def apply_imgdiff_patch_optimized(source_data: bytes, patch_data: bytes, bonus_data: bytes = None) -> bytes:  
-    """Apply ImgDiff patch with support for all chunk types and performance optimizations"""  
+    """Apply ImgDiff patch with basic error handling"""  
       
     if len(patch_data) < 12:  
         raise ValueError("Patch too short to contain header")  
@@ -125,83 +126,79 @@ def apply_imgdiff_patch_optimized(source_data: bytes, patch_data: bytes, bonus_d
     num_chunks = read_le_int32(patch_data, 8)  
     pos = 12  
       
-    # Python 3.13优化：预分配输出缓冲区  
+    if num_chunks <= 0 or num_chunks > 1000:  
+        raise ValueError(f"Invalid number of chunks: {num_chunks}")  
+      
     output_chunks = []  
       
-    # 使用线程池并行处理chunk（适用于多个chunk的情况）  
-    if num_chunks > 1:  
-        with ThreadPoolExecutor(max_workers=min(4, num_chunks)) as executor:  
-            chunk_futures = []  
-              
-            for chunk_idx in range(num_chunks):  
-                if pos + 4 > len(patch_data):  
-                    raise ValueError(f"Failed to read chunk {chunk_idx} record")  
-                  
-                chunk_type = read_le_int32(patch_data, pos)  
-                pos += 4  
-                  
-                # 提交chunk处理任务到线程池  
-                future = executor.submit(process_chunk, chunk_idx, chunk_type, source_data,   
-                                       patch_data, pos, bonus_data)  
-                chunk_futures.append(future)  
-                  
-                # 更新pos位置  
-                pos = update_pos_for_chunk_type(chunk_type, patch_data, pos)  
-              
-            # 收集结果  
-            for future in chunk_futures:  
-                chunk_data = future.result()  
-                output_chunks.append(chunk_data)  
-    else:  
-        # 单个chunk直接处理  
-        for chunk_idx in range(num_chunks):  
-            if pos + 4 > len(patch_data):  
-                raise ValueError(f"Failed to read chunk {chunk_idx} record")  
-              
-            chunk_type = read_le_int32(patch_data, pos)  
-            pos += 4  
-              
-            chunk_data = process_chunk(chunk_idx, chunk_type, source_data, patch_data, pos, bonus_data)  
-            output_chunks.append(chunk_data)  
-            pos = update_pos_for_chunk_type(chunk_type, patch_data, pos)  
+    for chunk_idx in range(num_chunks):  
+        if pos + 4 > len(patch_data):  
+            raise ValueError(f"Failed to read chunk {chunk_idx} record")  
+          
+        chunk_type = read_le_int32(patch_data, pos)  
+        pos += 4  
+          
+        # 初始化 chunk_data 确保变量存在  
+        chunk_data = None  
+          
+        if chunk_type == CHUNK_NORMAL:  
+            chunk_data, pos = process_normal_chunk(chunk_idx, source_data, patch_data, pos)  
+        elif chunk_type == CHUNK_RAW:  
+            chunk_data, pos = process_raw_chunk(chunk_idx, patch_data, pos)  
+        elif chunk_type in (CHUNK_GZIP, CHUNK_DEFLATE):  
+            chunk_data, pos = process_compressed_chunk(chunk_idx, chunk_type, source_data, patch_data, pos, bonus_data)  
+        else:  
+            raise ValueError(f"Unknown chunk type: {chunk_type}")  
+          
+        if chunk_data is None:  
+            raise ValueError(f"Failed to process chunk {chunk_idx}: no data returned")  
+          
+        output_chunks.append(chunk_data)  
       
-    # Python 3.13优化：使用join合并字节数据  
-    return b''.join(output_chunks)  
+    return b''.join(output_chunks)
+
+
   
-def process_chunk(chunk_idx: int, chunk_type: int, source_data: bytes,   
+def process_chunk(chunk_idx: int, chunk_type: int, source_data: bytes,     
                  patch_data: bytes, pos: int, bonus_data: bytes = None) -> bytes:  
-    """Process individual chunk with type-specific logic"""  
+    """Process individual chunk with type-specific logic and better error handling"""  
       
+    # Add validation for chunk type  
+    if chunk_type not in (CHUNK_NORMAL, CHUNK_GZIP, CHUNK_DEFLATE, CHUNK_RAW):  
+        # Log the problematic chunk type for debugging  
+        BlockImageUpdate.logger.error(f"Unknown chunk type: {chunk_type} at position {pos}")  
+        BlockImageUpdate.logger.error(f"Patch data around position: {patch_data[max(0, pos-10):pos+10].hex()}")  
+        raise ValueError(f"Unknown chunk type: {chunk_type}")  
+        
     if chunk_type == CHUNK_NORMAL:  
         if pos + 24 > len(patch_data):  
             raise ValueError(f"Failed to read chunk {chunk_idx} normal header")  
-          
+            
         src_start = read_le_int64(patch_data, pos)  
         src_len = read_le_int64(patch_data, pos + 8)  
         patch_offset = read_le_int64(patch_data, pos + 16)  
-          
+            
         if src_start + src_len > len(source_data):  
             raise ValueError(f"Source parameters out of range: start={src_start}, len={src_len}")  
-          
+            
         chunk_source = source_data[src_start:src_start + src_len]  
         chunk_patch = patch_data[patch_offset:]  
         return apply_bsdiff_patch(chunk_source, chunk_patch)  
-          
+            
     elif chunk_type in (CHUNK_GZIP, CHUNK_DEFLATE):  
         if pos + 32 > len(patch_data):  
             raise ValueError(f"Failed to read chunk {chunk_idx} gzip/deflate header")  
-          
+            
         src_start = read_le_int64(patch_data, pos)  
         src_len = read_le_int64(patch_data, pos + 8)  
         patch_offset = read_le_int64(patch_data, pos + 16)  
         expanded_len = read_le_int64(patch_data, pos + 24)  
-          
+            
         if src_start + src_len > len(source_data):  
             raise ValueError(f"Source parameters out of range: start={src_start}, len={src_len}")  
-          
+            
         compressed_source = source_data[src_start:src_start + src_len]  
-          
-        # Python 3.13优化：使用更高效的解压缩  
+            
         try:  
             if chunk_type == CHUNK_GZIP:  
                 uncompressed_source = zlib.decompress(compressed_source, 16 + zlib.MAX_WBITS)  
@@ -209,17 +206,16 @@ def process_chunk(chunk_idx: int, chunk_type: int, source_data: bytes,
                 uncompressed_source = zlib.decompress(compressed_source)  
         except zlib.error as e:  
             raise ValueError(f"Failed to decompress chunk {chunk_idx}: {e}")  
-          
-        # 处理bonus数据  
+            
+        # Handle bonus data  
         if bonus_data and expanded_len > len(uncompressed_source):  
             bonus_size = expanded_len - len(uncompressed_source)  
             if bonus_size <= len(bonus_data):  
                 uncompressed_source += bonus_data[:bonus_size]  
-          
+            
         chunk_patch = patch_data[patch_offset:]  
         patched_uncompressed = apply_bsdiff_patch(uncompressed_source, chunk_patch)  
-          
-        # 重新压缩  
+            
         try:  
             if chunk_type == CHUNK_GZIP:  
                 return zlib.compress(patched_uncompressed, level=6, wbits=16 + zlib.MAX_WBITS)  
@@ -227,34 +223,135 @@ def process_chunk(chunk_idx: int, chunk_type: int, source_data: bytes,
                 return zlib.compress(patched_uncompressed, level=6)  
         except zlib.error as e:  
             raise ValueError(f"Failed to recompress chunk {chunk_idx}: {e}")  
-              
+                
     elif chunk_type == CHUNK_RAW:  
         if pos + 8 > len(patch_data):  
             raise ValueError(f"Failed to read chunk {chunk_idx} raw header")  
-          
+            
         data_len = read_le_int64(patch_data, pos)  
         pos += 8  
-          
+            
         if pos + data_len > len(patch_data):  
             raise ValueError(f"Raw chunk data out of range")  
-          
-        return patch_data[pos:pos + data_len]  
-          
-    else:  
-        raise ValueError(f"Unknown chunk type: {chunk_type}")  
+            
+        return patch_data[pos:pos + data_len]
+
+def process_normal_chunk(chunk_idx: int, source_data: bytes, patch_data: bytes, pos: int) -> Tuple[bytes, int]:  
+    """Process CHUNK_NORMAL"""  
+    if pos + 24 > len(patch_data):  
+        raise ValueError(f"Failed to read chunk {chunk_idx} normal header")  
+      
+    src_start = read_le_int64(patch_data, pos)  
+    src_len = read_le_int64(patch_data, pos + 8)  
+    patch_offset = read_le_int64(patch_data, pos + 16)  
+      
+    if src_start + src_len > len(source_data):  
+        raise ValueError(f"Source parameters out of range: start={src_start}, len={src_len}")  
+      
+    chunk_source = source_data[src_start:src_start + src_len]  
+    chunk_patch = patch_data[patch_offset:]  
+    result = apply_bsdiff_patch(chunk_source, chunk_patch)  
+    return result, pos + 24  
+  
+def process_raw_chunk(chunk_idx: int, patch_data: bytes, pos: int) -> Tuple[bytes, int]:  
+    """Process CHUNK_RAW with correct length reading"""  
+    if pos + 4 > len(patch_data):  
+        raise ValueError(f"Failed to read chunk {chunk_idx} raw header")  
+      
+    data_len = read_le_int32(patch_data, pos)  # 使用 32 位读取  
+    pos += 4  
+      
+    if pos + data_len > len(patch_data):  
+        raise ValueError(f"Raw chunk data out of range")  
+      
+    return patch_data[pos:pos + data_len], pos + data_len
+
+
+
+  
+def process_compressed_chunk(chunk_idx: int, chunk_type: int, source_data: bytes,   
+                           patch_data: bytes, pos: int, bonus_data: bytes = None) -> Tuple[bytes, int]:  
+    """Process CHUNK_GZIP or CHUNK_DEFLATE with basic compression handling"""  
+      
+    header_size = 60 if chunk_type == CHUNK_DEFLATE else 32  
+      
+    if pos + header_size > len(patch_data):  
+        raise ValueError(f"Failed to read chunk {chunk_idx} compressed header")  
+      
+    src_start = read_le_int32(patch_data, pos)  
+    src_len = read_le_int32(patch_data, pos + 8)  
+    patch_offset = read_le_int32(patch_data, pos + 16)  
+    expanded_len = read_le_int32(patch_data, pos + 24)  
+      
+    # 对于 CHUNK_DEFLATE，读取压缩参数但使用安全默认值  
+    compression_level = 6  
+    if chunk_type == CHUNK_DEFLATE:  
+        level = read_le_int32(patch_data, pos + 32)  
+        if 0 <= level <= 9:  
+            compression_level = level  
+      
+    if src_start + src_len > len(source_data):  
+        raise ValueError(f"Source parameters out of range: start={src_start}, len={src_len}")  
+      
+    compressed_source = source_data[src_start:src_start + src_len]  
+      
+    # 解压缩源数据  
+    try:  
+        if chunk_type == CHUNK_GZIP:  
+            uncompressed_source = zlib.decompress(compressed_source, 16 + zlib.MAX_WBITS)  
+        else:  # CHUNK_DEFLATE  
+            try:  
+                uncompressed_source = zlib.decompress(compressed_source)  
+            except zlib.error:  
+                uncompressed_source = zlib.decompress(compressed_source, -zlib.MAX_WBITS)  
+    except zlib.error as e:  
+        raise ValueError(f"Failed to decompress chunk {chunk_idx}: {e}")  
+      
+    # 处理 bonus data  
+    if bonus_data and chunk_idx == 1 and expanded_len > len(uncompressed_source):  
+        bonus_size = expanded_len - len(uncompressed_source)  
+        if bonus_size <= len(bonus_data):  
+            uncompressed_source += bonus_data[:bonus_size]  
+      
+    # 应用 bsdiff 补丁  
+    chunk_patch = patch_data[patch_offset:]  
+    patched_uncompressed = apply_bsdiff_patch(uncompressed_source, chunk_patch)  
+      
+    # 重新压缩  
+    try:  
+        if chunk_type == CHUNK_GZIP:  
+            result = zlib.compress(patched_uncompressed, level=compression_level, wbits=16 + zlib.MAX_WBITS)  
+        else:  # CHUNK_DEFLATE  
+            result = zlib.compress(patched_uncompressed, level=compression_level)  
+    except zlib.error as e:  
+        raise ValueError(f"Failed to recompress chunk {chunk_idx}: {e}")  
+      
+    return result, pos + header_size
+
+
   
 def update_pos_for_chunk_type(chunk_type: int, patch_data: bytes, pos: int) -> int:  
-    """Update position based on chunk type"""  
+    """Update position based on chunk type with better validation"""  
     if chunk_type == CHUNK_NORMAL:  
-        return pos + 24  
+        new_pos = pos + 24  
     elif chunk_type in (CHUNK_GZIP, CHUNK_DEFLATE):  
-        return pos + 32  
+        new_pos = pos + 32  
     elif chunk_type == CHUNK_RAW:  
+        if pos + 8 > len(patch_data):  
+            raise ValueError("Cannot read RAW chunk length")  
         data_len = read_le_int64(patch_data, pos)  
-        return pos + 8 + data_len  
+        if data_len < 0 or data_len > len(patch_data):  
+            raise ValueError(f"Invalid RAW chunk data length: {data_len}")  
+        new_pos = pos + 8 + data_len  
     else:  
-        raise ValueError(f"Unknown chunk type: {chunk_type}")
-                         
+        raise ValueError(f"Unknown chunk type: {chunk_type}")  
+      
+    # Validate new position  
+    if new_pos > len(patch_data):  
+        raise ValueError(f"Position {new_pos} exceeds patch data length {len(patch_data)}")  
+      
+    return new_pos
+                 
 async def generate_target_async(source_file: FileContents, patch_data: bytes,  
                                target_filename: str, target_sha1: bytes,  
                                target_size: int, bonus_data: bytes = None) -> bool:  

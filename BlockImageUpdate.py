@@ -28,7 +28,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)  
 
 try:  
-    from ApplyPatch import applypatch, apply_bsdiff_patch, apply_imgdiff_patch
+    from ApplyPatch import apply_bsdiff_patch,apply_imgdiff_patch_optimized
     APPLYPATCH_AVAILABLE = True  
 except ImportError:  
     APPLYPATCH_AVAILABLE = False  
@@ -206,6 +206,10 @@ class BlockImageUpdate:
 
         # FUCKING ERRORs
         self.continue_on_error = continue_on_error
+
+        # Add this line in the __init__ method  
+        self.failed_command_details = {}
+
       
     def _get_optimal_io_settings(self) -> IOSettings:  
         """Get platform-specific optimal I/O settings"""  
@@ -252,47 +256,112 @@ class BlockImageUpdate:
             raise  
       
     def _new_data_producer(self):  
-        """Optimized producer thread with better buffering"""  
+        """Optimized producer thread with better buffering and error recovery"""  
         logger.info("New data producer thread starting")  
-        buffer_size = self.BLOCKSIZE * 10  # Read multiple blocks at once  
-        
-        should_exit = False  
+        buffer_size = self.BLOCKSIZE * 10  
         
         try:  
-            while self.new_data_producer_running.is_set() and not should_exit:  
+            while self.new_data_producer_running.is_set():  
                 try:  
-                    # Read larger chunks for better I/O efficiency  
+                    # Check if file descriptor is still valid  
+                    if not self.new_data_fd or self.new_data_fd.closed:  
+                        logger.error("New data file descriptor is closed")  
+                        break  
+                    
                     data = self.new_data_fd.read(buffer_size)  
                     if not data:  
                         self.new_data_queue.put(None)  # EOF signal  
-                        should_exit = True  
-                        continue  
+                        break  
                     
                     # Split into individual blocks  
                     for i in range(0, len(data), self.BLOCKSIZE):  
                         if not self.new_data_producer_running.is_set():  
-                            should_exit = True  
                             break  
                         
                         block = data[i:i + self.BLOCKSIZE]  
                         if len(block) < self.BLOCKSIZE:  
                             block = block.ljust(self.BLOCKSIZE, b'\x00')  
                         
-                        self.new_data_queue.put(block)  
+                        # Use timeout to avoid blocking indefinitely  
+                        try:  
+                            self.new_data_queue.put(block, timeout=5)  
+                        except queue.Full:  
+                            logger.warning("New data queue is full, producer may be blocked")  
+                            continue  
                         
                         with self.new_data_condition:  
                             self.new_data_condition.notify_all()  
-                
-                except* (IOError, OSError) as eg:  
-                    for error in eg.exceptions:  
-                        logger.error(f"Producer error: {error}")  
-                    self.new_data_queue.put(None)  
-                    should_exit = True  # 设置标志变量而不是return  
+                    
+                except (IOError, OSError) as e:  
+                    logger.error(f"Producer I/O error: {e}")  
+                    break  
+                except Exception as e:  
+                    logger.error(f"Producer unexpected error: {e}")  
+                    break  
                     
         except Exception as e:  
             logger.error(f"Producer fatal error: {e}")  
         finally:  
-            logger.info("New data producer thread terminating")
+            # Signal EOF and cleanup  
+            try:  
+                self.new_data_queue.put(None)  
+            except:  
+                pass  
+            logger.info("New data producer thread terminating")  
+    
+    def _restart_producer_thread(self) -> bool:  
+        """Restart the producer thread if it has died"""  
+        try:  
+            # Stop existing thread if running  
+            if self.new_data_producer_thread and self.new_data_producer_thread.is_alive():  
+                self.new_data_producer_running.clear()  
+                self.new_data_producer_thread.join(timeout=2)  
+            
+            # 不要清理队列中的现有数据，让它们继续被消费  
+            # 只有在确实需要时才清理  
+            
+            # Check if new data file is still valid  
+            if not self.new_data_fd or self.new_data_fd.closed:  
+                logger.error("New data file descriptor is not available for restart")  
+                return False  
+            
+            # 保持当前文件位置，不要重置  
+            try:  
+                current_pos = self.new_data_fd.tell()  
+                self.new_data_fd.seek(0, 2)  
+                file_size = self.new_data_fd.tell()  
+                self.new_data_fd.seek(current_pos)  
+                
+                logger.info(f"Restarting producer at position: {current_pos}/{file_size}")  
+                
+                if current_pos >= file_size:  
+                    logger.info("At end of file, producer may not need restart")  
+                    return True  # 不是错误，只是到了文件末尾  
+                    
+            except Exception as e:  
+                logger.error(f"Cannot determine file position: {e}")  
+                return False  
+            
+            # Restart the thread  
+            self.new_data_producer_running.set()  
+            self.new_data_producer_thread = threading.Thread(  
+                target=self._new_data_producer,  
+                daemon=True  
+            )  
+            self.new_data_producer_thread.start()  
+            
+            # Verify thread started  
+            time.sleep(0.1)  
+            is_alive = self.new_data_producer_thread.is_alive()  
+            
+            if not is_alive:  
+                logger.error("Producer thread failed to start or died immediately")  
+            
+            return is_alive  
+            
+        except Exception as e:  
+            logger.error(f"Failed to restart producer thread: {e}")  
+            return False
 
       
     def __enter__(self) -> Self:  
@@ -462,19 +531,27 @@ class BlockImageUpdate:
             return -1  
   
     def perform_command_new(self, tokens: List[str], pos: int) -> int:  
-        """Write new data to specified blocks using RangeSink"""  
+        """Write new data to specified blocks using RangeSink with thread recovery"""  
         if pos >= len(tokens):  
             logger.error("Missing target blocks for new")  
             return -1  
-  
+    
         try:  
             rangeset = RangeSet(tokens[pos])  
             logger.info(f"Writing {rangeset.size} blocks of new data")  
-  
+    
+            # 移除严格的文件大小检查，因为生产者线程会动态读取数据  
+            # 只检查生产者线程状态  
+            if not self.new_data_producer_thread or not self.new_data_producer_thread.is_alive():  
+                logger.warning("Producer thread not running, attempting to restart")  
+                if not self._restart_producer_thread():  
+                    logger.error("Failed to restart producer thread")  
+                    return -1  
+    
             # Auto-expand block device if needed  
             max_block_needed = max(end for _, end in rangeset)  
             required_device_size = max_block_needed * self.BLOCKSIZE  
-              
+            
             current_device_size = self.blockdev_path.stat().st_size  
             if current_device_size < required_device_size:  
                 logger.info(f"Auto-expanding block device from {current_device_size} to {required_device_size} bytes")  
@@ -483,15 +560,10 @@ class BlockImageUpdate:
                     padding_needed = required_device_size - current_device_size  
                     f.write(b'\x00' * padding_needed)  
                     f.flush()  
-  
-            # Check producer thread  
-            if not self.new_data_producer_thread or not self.new_data_producer_thread.is_alive():  
-                logger.error("New data producer thread is not running")  
-                return -1  
-  
+    
             with self._open_block_device('r+b') as f:  
                 range_sink = RangeSinkState(rangeset, f, self.BLOCKSIZE)  
-                  
+                
                 blocks_to_write = rangeset.size  
                 for _ in range(blocks_to_write):  
                     try:  
@@ -499,27 +571,29 @@ class BlockImageUpdate:
                         if data is None:  # EOF signal  
                             logger.warning("Unexpected EOF from new data stream")  
                             break  
-                          
+                        
                         if len(data) != self.BLOCKSIZE:  
                             data = data.ljust(self.BLOCKSIZE, b'\x00')  
-                          
+                        
                         written = range_sink.write(data)  
                         if written != self.BLOCKSIZE:  
                             logger.error(f"Short write: expected {self.BLOCKSIZE}, got {written}")  
                             return -1  
-                              
+                        
                         self.new_data_queue.task_done()  
-                          
+                        
                     except queue.Empty:  
                         logger.error("Timeout waiting for new data")  
                         return -1  
-  
+    
             self.written += rangeset.size  
             return 0  
-  
+    
         except Exception as e:  
             logger.error(f"Failed to write new data: {e}")  
-            return -1  
+            return -1
+
+
   
     def perform_command_move(self, tokens: List[str], pos: int) -> int:  
         """Move data between block ranges with proper version handling"""  
@@ -554,125 +628,176 @@ class BlockImageUpdate:
             logger.error(f"Failed to move blocks: {e}")  
             return -1  
   
+  
     def perform_command_diff(self, tokens: List[str], pos: int, cmd_name: str) -> int:  
-        """Apply diff patches with memory-mapped patch data"""  
+        """Apply diff patches with memory-mapped patch data - Enhanced for V4 compatibility"""  
         if pos + 1 >= len(tokens):  
             logger.error(f"Missing patch offset or length for {cmd_name}")  
             return -1  
-  
+    
         try:  
             offset = int(tokens[pos])  
             length = int(tokens[pos + 1])  
             pos += 2  
-  
+    
             # Parse based on transfer list version  
             if self.version >= 3:  
                 if pos + 4 >= len(tokens):  
                     logger.error("Missing required parameters for version 3+ diff")  
                     return -1  
-                  
+                
                 src_hash = tokens[pos]  
                 tgt_hash = tokens[pos + 1]  
                 tgt_range = tokens[pos + 2]  
                 src_blocks = int(tokens[pos + 3])  
                 pos += 4  
-  
+    
                 tgt_rangeset = RangeSet(tgt_range)  
-                  
-                # Handle source data  
-                if pos < len(tokens) and tokens[pos] != "-":  
-                    src_rangeset = RangeSet(tokens[pos])  
-                    src_data = self._read_blocks(src_rangeset)  
-                    pos += 1  
-                else:  
-                    src_data = b'\x00' * (src_blocks * self.BLOCKSIZE)  
-                    if pos < len(tokens):  
-                        pos += 1  
-  
-                # Handle stash specifications  
-                while pos < len(tokens):  
-                    stash_spec = tokens[pos]  
-                    if ':' in stash_spec:  
-                        self._apply_stash_data(src_data, stash_spec)  
-                    pos += 1  
+                
+                # Load source data using version 3 loader  
+                try:  
+                    _, src_data, _, _ = self._load_src_tgt_version3(tokens, pos - 4, onehash=False)  
+                except Exception as e:  
+                    logger.error(f"Failed to load source data: {e}")  
+                    return -1  
+                    
             else:  
                 # Version 1/2 handling  
+                if pos + 1 >= len(tokens):  
+                    logger.error("Missing target/source ranges for version 1/2 diff")  
+                    return -1  
+                    
                 tgt_rangeset = RangeSet(tokens[pos])  
                 src_rangeset = RangeSet(tokens[pos + 1])  
                 src_data = self._read_blocks(src_rangeset)  
                 tgt_hash = None  
-  
-            # Verify source hash if available  
-            if self.version >= 3 and src_hash and src_hash != "0" * 40:  
-                actual_src_hash = hashlib.sha1(src_data).hexdigest()  
-                if actual_src_hash != src_hash:  
-                    logger.error(f"Source hash mismatch: expected {src_hash}, got {actual_src_hash}")  
+                
+                if src_data is None:  
+                    logger.error("Failed to read source blocks")  
                     return -1  
-  
+    
             # Extract patch data using memory mapping if available  
             if self.patch_data_mmap:  
-                patch_data = self.patch_data_mmap[offset:offset + length]  
+                patch_data = bytes(self.patch_data_mmap[offset:offset + length])  
             else:  
                 self.patch_data_fd.seek(offset)  
                 patch_data = self.patch_data_fd.read(length)  
-  
-            # Apply patch  
-            result = self._apply_patch_internal(src_data, patch_data, cmd_name, tgt_hash)
+    
+            # Apply patch with proper error handling  
+            result = self._apply_patch_internal(src_data, patch_data, cmd_name, tgt_hash)  
             if result is None:  
                 return -1  
-  
-            # Write result using RangeSink  
-            with self._open_block_device('r+b') as f:  
-                range_sink = RangeSinkState(tgt_rangeset, f, self.BLOCKSIZE)  
-                  
-                data_offset = 0  
-                while data_offset < len(result):  
-                    chunk = result[data_offset:data_offset + self.BLOCKSIZE]  
-                    if len(chunk) < self.BLOCKSIZE:  
-                        chunk = chunk.ljust(self.BLOCKSIZE, b'\x00')  
-                      
-                    written = range_sink.write(chunk)  
-                    if written == 0:  
-                        break  
-                    data_offset += written  
-  
+    
+            # Write result using RangeSink with proper block alignment  
+            if not self._write_blocks(tgt_rangeset, result):  
+                logger.error("Failed to write patched blocks")  
+                return -1  
+    
             self.written += tgt_rangeset.size  
             return 0  
-  
+    
         except Exception as e:  
             logger.error(f"Failed to apply {cmd_name} patch: {e}")  
-            return -1  
-  
-    def _apply_patch_internal(self, src_data: bytes, patch_data: bytes,   
-                            cmd_name: str, expected_tgt_hash: str) -> Optional[bytes]:  
-        """Apply patch using imported ApplyPatch functions with error handling"""  
-        if not APPLYPATCH_AVAILABLE:  
-            return self._apply_patch_external(src_data, patch_data, cmd_name, expected_tgt_hash)  
+            return -1
+
+
+    def _new_data_producer(self):  
+        """Optimized producer thread with better buffering and error recovery"""  
+        logger.info("New data producer thread starting")  
+        buffer_size = self.BLOCKSIZE * 10  
         
         try:  
-            if patch_data.startswith(b'BSDIFF40'):  
-                result = apply_bsdiff_patch(src_data, patch_data)  
-            elif patch_data.startswith(b'IMGDIFF2'):  
-                result = apply_imgdiff_patch(src_data, patch_data)  
-            else:  
-                logger.error("Unknown patch format")  
-                return None  
-    
-            # Verify target hash if provided  
-            if expected_tgt_hash and expected_tgt_hash != "0" * 40:  
-                actual_hash = hashlib.sha1(result).hexdigest()  
-                if actual_hash != expected_tgt_hash:  
-                    logger.error(f"Target hash mismatch: expected {expected_tgt_hash}, got {actual_hash}")  
-                    return None  
-    
-            return result  
-    
-        except (OverflowError, ValueError) as e:  
-            logger.warning(f"Integer overflow in patch application: {e}, falling back to external process")  
-            return self._apply_patch_external(src_data, patch_data, cmd_name, expected_tgt_hash)  
+            while self.new_data_producer_running.is_set():  
+                try:  
+                    # Check if file descriptor is still valid  
+                    if not self.new_data_fd or self.new_data_fd.closed:  
+                        logger.error("New data file descriptor is closed")  
+                        break  
+                    
+                    # Check current position and file size  
+                    current_pos = self.new_data_fd.tell()  
+                    self.new_data_fd.seek(0, 2)  # Seek to end  
+                    file_size = self.new_data_fd.tell()  
+                    self.new_data_fd.seek(current_pos)  # Restore position  
+                    
+                    if current_pos >= file_size:  
+                        logger.info("Reached end of new data file")  
+                        self.new_data_queue.put(None)  # EOF signal  
+                        break  
+                    
+                    data = self.new_data_fd.read(buffer_size)  
+                    if not data:  
+                        logger.info("No more data available, sending EOF signal")  
+                        self.new_data_queue.put(None)  # EOF signal  
+                        break  
+                    
+                    # Split into individual blocks  
+                    for i in range(0, len(data), self.BLOCKSIZE):  
+                        if not self.new_data_producer_running.is_set():  
+                            break  
+                        
+                        block = data[i:i + self.BLOCKSIZE]  
+                        if len(block) < self.BLOCKSIZE:  
+                            block = block.ljust(self.BLOCKSIZE, b'\x00')  
+                        
+                        # Use timeout to avoid blocking indefinitely  
+                        try:  
+                            self.new_data_queue.put(block, timeout=5)  
+                        except queue.Full:  
+                            logger.warning("New data queue is full, producer may be blocked")  
+                            continue  
+                        
+                        with self.new_data_condition:  
+                            self.new_data_condition.notify_all()  
+                    
+                except (IOError, OSError) as e:  
+                    logger.error(f"Producer I/O error: {e}")  
+                    break  
+                except Exception as e:  
+                    logger.error(f"Producer unexpected error: {e}")  
+                    break  
+                    
         except Exception as e:  
-            logger.error(f"Failed to apply patch using imported functions: {e}")  
-            return self._apply_patch_external(src_data, patch_data, cmd_name, expected_tgt_hash)
+            logger.error(f"Producer fatal error: {e}")  
+        finally:  
+            # Signal EOF and cleanup  
+            try:  
+                self.new_data_queue.put(None)  
+            except:  
+                pass  
+            logger.info("New data producer thread terminating") 
+  
+    def _apply_patch_internal(self, src_data: bytes, patch_data: bytes,     
+                            cmd_name: str, expected_tgt_hash: str) -> Optional[bytes]:    
+        """Apply patch using imported ApplyPatch functions with basic error handling"""    
+        try:    
+            # 确保 src_data 是 bytes 类型  
+            if isinstance(src_data, bytearray):    
+                src_data = bytes(src_data)    
+            
+            if patch_data.startswith(b'BSDIFF40'):    
+                result = apply_bsdiff_patch(src_data, patch_data)    
+            elif patch_data.startswith(b'IMGDIFF2'):    
+                logger.info(f"Processing IMGDIFF2 patch: size={len(patch_data)}, src_size={len(src_data)}")  
+                result = apply_imgdiff_patch_optimized(src_data, patch_data)    
+            else:    
+                logger.error(f"Unknown patch format: {patch_data[:8].hex()}")    
+                return None    
+    
+            # 验证目标哈希  
+            if expected_tgt_hash and expected_tgt_hash != "0" * 40:    
+                actual_hash = hashlib.sha1(result).hexdigest()    
+                if actual_hash != expected_tgt_hash:    
+                    logger.error(f"Target hash mismatch: expected {expected_tgt_hash}, got {actual_hash}")    
+                    return None    
+    
+            return result    
+    
+        except Exception as e:    
+            logger.error(f"Failed to apply patch: {e}")    
+            return None
+
+
 
     def _apply_patch_external(self, src_data: bytes, patch_data: bytes,   
                             cmd_name: str, expected_tgt_hash: str) -> Optional[bytes]:  
@@ -1220,7 +1345,9 @@ class BlockImageUpdate:
             'free': lambda tokens, pos: self.perform_command_free(tokens, pos),  
         }  
     
-        failed_commands = 0  # 记录失败的命令数量  
+        # 记录每种命令的失败次数  
+        failed_command_counts = {}  
+        total_failed = 0  
     
         for line_num in range(start_line, len(self.transfer_lines)):  
             line = self.transfer_lines[line_num].strip()  
@@ -1236,7 +1363,8 @@ class BlockImageUpdate:
                 logger.error(f"Unknown command: {cmd}")  
                 if not self.continue_on_error:  
                     return -1  
-                failed_commands += 1  
+                failed_command_counts[cmd] = failed_command_counts.get(cmd, 0) + 1  
+                total_failed += 1  
                 continue  
     
             logger.info(f"Executing: {cmd}")  
@@ -1246,7 +1374,8 @@ class BlockImageUpdate:
                     logger.error(f"Command {cmd} failed with code {result}")  
                     if self.continue_on_error:  
                         logger.warning(f"Continuing execution despite error in {cmd} command")  
-                        failed_commands += 1  
+                        failed_command_counts[cmd] = failed_command_counts.get(cmd, 0) + 1  
+                        total_failed += 1  
                         continue  
                     else:  
                         return result  
@@ -1258,13 +1387,18 @@ class BlockImageUpdate:
                 logger.error(f"Exception executing command {cmd}: {e}")  
                 if self.continue_on_error:  
                     logger.warning(f"Continuing execution despite exception in {cmd} command")  
-                    failed_commands += 1  
+                    failed_command_counts[cmd] = failed_command_counts.get(cmd, 0) + 1  
+                    total_failed += 1  
                     continue  
                 else:  
                     return -1  
     
-        # 返回失败命令的数量，0表示全部成功  
-        return failed_commands
+        # 如果有失败的命令，将详细信息存储到实例变量中  
+        if total_failed > 0:  
+            self.failed_command_details = failed_command_counts  
+        
+        return total_failed
+
 
   
     def _handle_zero_command(self, tokens: List[str], pos: int) -> int:  
@@ -1330,7 +1464,15 @@ def main():
             if result == 0:  
                 print("Done")  
             elif continue_on_error and result > 0:  
-                print(f"Done with {result} failed commands (continued execution)")  
+                # 生成详细的失败命令报告  
+                if hasattr(biu, 'failed_command_details') and biu.failed_command_details:  
+                    failure_details = []  
+                    for cmd, count in sorted(biu.failed_command_details.items()):  
+                        failure_details.append(f"{cmd}*{count}")  
+                    failure_summary = " ".join(failure_details)  
+                    print(f"Done with {result} failed commands ({failure_summary}) (continued execution)")  
+                else:  
+                    print(f"Done with {result} failed commands (continued execution)")  
             else:  
                 print(f"Done with error code: {result}")  
   
@@ -1338,6 +1480,7 @@ def main():
     except Exception as e:  
         print(f"Fatal error: {e}")  
         return -1
+
 
   
 if __name__ == "__main__":  

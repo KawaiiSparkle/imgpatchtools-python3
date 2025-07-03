@@ -17,8 +17,8 @@ CPython 3.13(With Only Bsdiff4 Module)
 
 
 ## Working Status
-x bsdiff(Too Unstable)/imgdiff
-- transfer.list(V4):stash/free/new/zero/move
+x imgdiff
+- transfer.list(V4):erase/bsdiff/move/new/stash/free/zero
 - ApplyPatch.py(For patching boot with boot.img.p)
 
 ## How I wrote this
