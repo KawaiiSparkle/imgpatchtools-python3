@@ -16,29 +16,12 @@ import queue
 import mmap  
 import ctypes  
 import bsdiff4
-from typing import Self, List, Dict, Any, Optional, BinaryIO, Iterator, Tuple, Union, AsyncIterator  
+from typing import Self, List, Dict, Any, Optional, BinaryIO, Iterator, Tuple, Union  
 from pathlib import Path  
 import json  
 from contextlib import suppress, contextmanager  
 from dataclasses import dataclass  
-import logging
-from functools import lru_cache  
-from collections import OrderedDict
-import weakref
-import psutil  # 用于内存监控  
-import gc      # 垃圾回收控制  
-import asyncio
-
-
-@dataclass  
-class LargeFileConfig:  
-    """Large file processing configuration"""  
-    chunk_size_mb: int = 64          # 块大小（MB）  
-    memory_limit_mb: int = 1024      # 内存限制（MB）  
-    enable_streaming: bool = True     # 启用流式处理  
-    gc_frequency: int = 10           # 垃圾回收频率  
-    use_mmap_threshold_mb: int = 100 # 使用mmap的文件大小阈值
-
+import logging  
 
 # Configure logging  
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')  
@@ -51,144 +34,6 @@ except ImportError:
     APPLYPATCH_AVAILABLE = False  
     logger.warning("ApplyPatch module not available, will use external process")
   
-class LRUStashCache:  
-    """Thread-safe LRU cache for stash data with size limits"""  
-      
-    def __init__(self, max_items: int = 50, max_memory_mb: int = 500):  
-        self.max_items = max_items  
-        self.max_memory_bytes = max_memory_mb * 1024 * 1024  
-        self.cache = OrderedDict()  
-        self.current_memory = 0  
-        self.lock = threading.RLock()  
-        self.disk_cache_dir = None  
-      
-    def set_disk_cache_dir(self, cache_dir: Path):  
-        """Set directory for disk-based cache fallback"""  
-        self.disk_cache_dir = cache_dir  
-          
-    def get(self, key: str) -> Optional[bytes]:  
-        """Get stash data, checking memory cache first, then disk"""  
-        with self.lock:  
-            # Check memory cache first  
-            if key in self.cache:  
-                # Move to end (most recently used)  
-                value = self.cache.pop(key)  
-                self.cache[key] = value  
-                return value  
-              
-            # Check disk cache  
-            if self.disk_cache_dir:  
-                disk_file = self.disk_cache_dir / f"stash_{key}"  
-                if disk_file.exists():  
-                    try:  
-                        data = disk_file.read_bytes()  
-                        # Add to memory cache if there's room  
-                        self._add_to_memory_cache(key, data)  
-                        return data  
-                    except Exception as e:  
-                        logger.warning(f"Failed to read disk cache for {key}: {e}")  
-              
-            return None  
-      
-    def put(self, key: str, value: bytes):  
-        """Store stash data with automatic eviction"""  
-        with self.lock:  
-            # Remove if already exists to update position  
-            if key in self.cache:  
-                old_value = self.cache.pop(key)  
-                self.current_memory -= len(old_value)  
-              
-            # Try to add to memory cache  
-            if self._can_fit_in_memory(value):  
-                self._add_to_memory_cache(key, value)  
-            else:  
-                # Store to disk if too large for memory  
-                self._store_to_disk(key, value)  
-      
-    def _can_fit_in_memory(self, value: bytes) -> bool:  
-        """Check if value can fit in memory cache"""  
-        return len(value) <= self.max_memory_bytes // 4  # Don't use more than 25% for single item  
-      
-    def _add_to_memory_cache(self, key: str, value: bytes):  
-        """Add item to memory cache with eviction"""  
-        value_size = len(value)  
-          
-        # Evict items if necessary  
-        while (len(self.cache) >= self.max_items or   
-               self.current_memory + value_size > self.max_memory_bytes):  
-            if not self.cache:  
-                break  
-            self._evict_oldest()  
-          
-        # Add new item  
-        self.cache[key] = value  
-        self.current_memory += value_size  
-      
-    def _evict_oldest(self):  
-        """Evict the oldest item from memory cache"""  
-        if not self.cache:  
-            return  
-              
-        oldest_key, oldest_value = self.cache.popitem(last=False)  
-        self.current_memory -= len(oldest_value)  
-          
-        # Store evicted item to disk if possible  
-        self._store_to_disk(oldest_key, oldest_value)  
-      
-    def _store_to_disk(self, key: str, value: bytes):  
-        """Store item to disk cache"""  
-        if not self.disk_cache_dir:  
-            return  
-              
-        try:  
-            disk_file = self.disk_cache_dir / f"stash_{key}"  
-            disk_file.write_bytes(value)  
-            logger.debug(f"Stored stash {key} to disk ({len(value)} bytes)")  
-        except Exception as e:  
-            logger.warning(f"Failed to store stash {key} to disk: {e}")  
-      
-    def remove(self, key: str):  
-        """Remove item from both memory and disk cache"""  
-        with self.lock:  
-            # Remove from memory  
-            if key in self.cache:  
-                value = self.cache.pop(key)  
-                self.current_memory -= len(value)  
-              
-            # Remove from disk  
-            if self.disk_cache_dir:  
-                disk_file = self.disk_cache_dir / f"stash_{key}"  
-                try:  
-                    if disk_file.exists():  
-                        disk_file.unlink()  
-                except Exception as e:  
-                    logger.warning(f"Failed to remove disk cache for {key}: {e}")  
-      
-    def clear(self):  
-        """Clear all cached data"""  
-        with self.lock:  
-            self.cache.clear()  
-            self.current_memory = 0  
-              
-            # Clear disk cache  
-            if self.disk_cache_dir and self.disk_cache_dir.exists():  
-                try:  
-                    for file_path in self.disk_cache_dir.glob("stash_*"):  
-                        file_path.unlink()  
-                except Exception as e:  
-                    logger.warning(f"Failed to clear disk cache: {e}")  
-      
-    def get_memory_usage(self) -> dict:  
-        """Get current memory usage statistics"""  
-        with self.lock:  
-            return {  
-                'items_in_memory': len(self.cache),  
-                'memory_bytes': self.current_memory,  
-                'memory_mb': self.current_memory / (1024 * 1024),  
-                'max_items': self.max_items,  
-                'max_memory_mb': self.max_memory_bytes / (1024 * 1024)  
-            }
-
 @dataclass  
 class IOSettings:  
     """Platform-specific I/O optimization settings"""  
@@ -320,184 +165,50 @@ class RangeSinkState:
                     break  
           
         return written  
-
-class AsyncBlockProcessor:  
-    """Async block processor for improved I/O performance"""  
-      
-    def __init__(self, blocksize: int = 4096, max_concurrent: int = 4):  
-        self.blocksize = blocksize  
-        self.max_concurrent = max_concurrent  
-        self.semaphore = asyncio.Semaphore(max_concurrent)  
-      
-    async def read_blocks_async(self, fd: BinaryIO, rangeset: RangeSet) -> bytes:  
-        """Asynchronously read blocks from file descriptor"""  
-        tasks = []  
-          
-        for start_block, end_block in rangeset:  
-            task = self._read_range_async(fd, start_block, end_block)  
-            tasks.append(task)  
-          
-        results = await asyncio.gather(*tasks)  
-        return b''.join(results)  
-      
-    async def _read_range_async(self, fd: BinaryIO, start_block: int, end_block: int) -> bytes:  
-        """Read a single range asynchronously"""  
-        async with self.semaphore:  
-            loop = asyncio.get_event_loop()  
-              
-            def read_range():  
-                offset = start_block * self.blocksize  
-                size = (end_block - start_block) * self.blocksize  
-                fd.seek(offset)  
-                return fd.read(size)  
-              
-            return await loop.run_in_executor(None, read_range)  
-      
-    async def write_blocks_async(self, fd: BinaryIO, rangeset: RangeSet, data: bytes) -> bool:  
-        """Asynchronously write blocks to file descriptor"""  
-        tasks = []  
-        data_offset = 0  
-          
-        for start_block, end_block in rangeset:  
-            chunk_size = (end_block - start_block) * self.blocksize  
-            chunk_data = data[data_offset:data_offset + chunk_size]  
-              
-            task = self._write_range_async(fd, start_block, chunk_data)  
-            tasks.append(task)  
-            data_offset += chunk_size  
-          
-        results = await asyncio.gather(*tasks)  
-        return all(results)  
-      
-    async def _write_range_async(self, fd: BinaryIO, start_block: int, data: bytes) -> bool:  
-        """Write a single range asynchronously"""  
-        async with self.semaphore:  
-            loop = asyncio.get_event_loop()  
-              
-            def write_range():  
-                try:  
-                    offset = start_block * self.blocksize  
-                    fd.seek(offset)  
-                    fd.write(data)  
-                    return True  
-                except Exception as e:  
-                    logger.error(f"Async write failed: {e}")  
-                    return False  
-              
-            return await loop.run_in_executor(None, write_range)
   
 class BlockImageUpdate:  
     """Production-ready BlockImageUpdate implementation for Python 3.13"""  
       
     BLOCKSIZE = 4096  
       
-    def __init__(self, range_text: str):  
-        if not range_text or not isinstance(range_text, str):  
-            raise ValueError("Range text must be a non-empty string")  
-            
-        pieces = range_text.split(',')  
-        if len(pieces) < 3:  
-            raise ValueError(f"Invalid range format: {range_text}")  
-            
-        try:  
-            num = int(pieces[0])  
-        except ValueError:  
-            raise ValueError(f"Invalid range count: {pieces[0]}")  
-            
-        if num == 0:  
-            raise ValueError("Range count cannot be zero")  
-        if num % 2 != 0:  
-            raise ValueError("Range count must be even (pairs of start,end)")  
-        if num != len(pieces) - 1:  
-            raise ValueError(f"Range count mismatch: expected {num}, got {len(pieces) - 1}")  
-            
-        self.pos = []  
-        self.count = num // 2  
-        self.size = 0  
-            
-        # 修复：更严格的范围验证和溢出检查  
-        max_allowed_value = 2**31 - 1  # 与C++版本的INT_MAX一致  
+    def __init__(self, blockdev_path: str, transfer_list_path: str, new_data_path: str, patch_data_path: str, continue_on_error: bool = False):  
+
+        self.blockdev_path = Path(blockdev_path)  
+        self.transfer_list_path = Path(transfer_list_path)  
+        self.new_data_path = Path(new_data_path)  
+        self.patch_data_path = Path(patch_data_path)  
           
-        for i in range(0, num, 2):  
-            try:  
-                start = int(pieces[i + 1])  
-                end = int(pieces[i + 2])  
-            except (ValueError, IndexError) as e:  
-                raise ValueError(f"Invalid range values at position {i}: {e}")  
-                
-            # 更严格的边界检查  
-            if start < 0 or end < 0:  
-                raise ValueError(f"Range values cannot be negative: {start}, {end}")  
-            if start > max_allowed_value or end > max_allowed_value:  
-                raise ValueError(f"Range values exceed maximum allowed: {start}, {end}")  
-            if start >= end:  
-                raise ValueError(f"Invalid range: start >= end ({start} >= {end})")  
-              
-            # 修复：添加溢出检查，与C++版本一致  
-            range_size = end - start  
-            if self.size > (2**63 - 1) - range_size:  # 防止整数溢出  
-                raise ValueError(f"Range size overflow: total size would exceed maximum")  
-                
-            self.pos.extend([start, end])  
-            self.size += range_size  
-        # 添加更严格的C++兼容性检查  
-        if not all(isinstance(x, int) and 0 <= x <= 2**31-1 for x in self.pos):  
-            raise ValueError("Range values must be valid 32-bit unsigned integers")  
-        
-        # 添加内存使用限制检查  
-        estimated_memory = self.size * 4096  # BLOCKSIZE  
-        if estimated_memory > 2**31 - 1:  # 2GB limit like C++  
-            raise ValueError("Range set would require too much memory")
-                
-        # Validate ranges don't overlap  
-        self._validate_no_overlaps()
+        # Core state  
+        self.stash_map: Dict[str, bytes] = {}  
+        self.written = 0  
+        self.version = 1  
+        self.total_blocks = 0  
+        self.transfer_lines: List[str] = []  
+          
+        # File descriptors  
+        self.new_data_fd: Optional[BinaryIO] = None  
+        self.patch_data_fd: Optional[BinaryIO] = None  
+        self.patch_data_mmap: Optional[mmap.mmap] = None  
+          
+        # Platform-specific setup  
+        self.io_settings = self._get_optimal_io_settings()  
+        self.stash_base_dir = self._get_stash_directory()  
+          
+        # Threading for new data streaming  
+        self.new_data_queue: queue.Queue[Optional[bytes]] = queue.Queue(maxsize=20)  
+        self.new_data_producer_thread: Optional[threading.Thread] = None  
+        self.new_data_producer_running = threading.Event()  
+        self.new_data_condition = threading.Condition()  
+          
+        # Progress tracking  
+        self._last_progress_time = time.time()  
+        self.patch_stream_empty = False  
 
-    def _configure_large_file_handling(self) -> LargeFileConfig:  
-        """Configure large file handling based on file sizes and system memory"""  
-        config = LargeFileConfig()  
-        
-        try:  
-            # 检测系统内存  
-            available_memory_mb = psutil.virtual_memory().available // (1024 * 1024)  
-            
-            # 检测文件大小  
-            file_sizes = {}  
-            for name, path in [  
-                ('new_data', self.new_data_path),  
-                ('patch_data', self.patch_data_path),  
-                ('blockdev', self.blockdev_path)  
-            ]:  
-                if path.exists():  
-                    size_mb = path.stat().st_size // (1024 * 1024)  
-                    file_sizes[name] = size_mb  
-            
-            max_file_size = max(file_sizes.values()) if file_sizes else 0  
-            
-            # 动态调整配置  
-            if max_file_size > 4096:  # >4GB  
-                config.chunk_size_mb = 32  
-                config.memory_limit_mb = min(available_memory_mb // 4, 2048)  
-                config.enable_streaming = True  
-                config.gc_frequency = 5  
-            elif max_file_size > 1024:  # >1GB  
-                config.chunk_size_mb = 64  
-                config.memory_limit_mb = min(available_memory_mb // 3, 1024)  
-                config.enable_streaming = True  
-                config.gc_frequency = 10  
-            else:  
-                config.enable_streaming = False  
-            
-            logger.info(f"Large file config: {config}")  
-            logger.info(f"File sizes: {file_sizes}")  
-            logger.info(f"Available memory: {available_memory_mb}MB")  
-            
-            return config  
-            
-        except Exception as e:  
-            logger.warning(f"Failed to configure large file handling: {e}")  
-            return LargeFileConfig()
+        # FUCKING ERRORs
+        self.continue_on_error = continue_on_error
 
-
+        # Add this line in the __init__ method  
+        self.failed_command_details = {}
 
       
     def _get_optimal_io_settings(self) -> IOSettings:  
@@ -545,39 +256,23 @@ class BlockImageUpdate:
             raise  
       
     def _new_data_producer(self):  
-        """Thread-safe producer thread with improved synchronization"""  
+        """Optimized producer thread with better buffering and error recovery"""  
         logger.info("New data producer thread starting")  
         buffer_size = self.BLOCKSIZE * 10  
         
         try:  
             while self.new_data_producer_running.is_set():  
                 try:  
-                    # 使用锁保护整个文件操作序列  
-                    with self.new_data_lock:  
-                        # Check if file descriptor is still valid  
-                        if not self.new_data_fd or self.new_data_fd.closed:  
-                            logger.error("New data file descriptor is closed")  
-                            break  
-                        
-                        # 原子性地检查位置和读取数据  
-                        current_pos = self.new_data_fd.tell()  
-                        self.new_data_fd.seek(0, 2)  # Seek to end  
-                        file_size = self.new_data_fd.tell()  
-                        self.new_data_fd.seek(current_pos)  # Restore position  
-                        
-                        if current_pos >= file_size:  
-                            logger.info("Reached end of new data file")  
-                            self.new_data_queue.put(None)  # EOF signal  
-                            break  
-                        
-                        # 在锁内完成读取操作  
-                        data = self.new_data_fd.read(buffer_size)  
-                        if not data:  
-                            logger.info("No more data available, sending EOF signal")  
-                            self.new_data_queue.put(None)  # EOF signal  
-                            break  
+                    # Check if file descriptor is still valid  
+                    if not self.new_data_fd or self.new_data_fd.closed:  
+                        logger.error("New data file descriptor is closed")  
+                        break  
                     
-                    # 在锁外处理数据，避免长时间持有锁  
+                    data = self.new_data_fd.read(buffer_size)  
+                    if not data:  
+                        self.new_data_queue.put(None)  # EOF signal  
+                        break  
+                    
                     # Split into individual blocks  
                     for i in range(0, len(data), self.BLOCKSIZE):  
                         if not self.new_data_producer_running.is_set():  
@@ -592,8 +287,6 @@ class BlockImageUpdate:
                             self.new_data_queue.put(block, timeout=5)  
                         except queue.Full:  
                             logger.warning("New data queue is full, producer may be blocked")  
-                            # 在队列满时，短暂等待而不是跳过  
-                            time.sleep(0.1)  
                             continue  
                         
                         with self.new_data_condition:  
@@ -614,49 +307,50 @@ class BlockImageUpdate:
                 self.new_data_queue.put(None)  
             except:  
                 pass  
-            logger.info("New data producer thread terminating") 
+            logger.info("New data producer thread terminating")  
     
     def _restart_producer_thread(self) -> bool:  
-        """Thread-safe restart with improved synchronization"""  
+        """Restart the producer thread if it has died"""  
         try:  
             # Stop existing thread if running  
             if self.new_data_producer_thread and self.new_data_producer_thread.is_alive():  
                 self.new_data_producer_running.clear()  
                 self.new_data_producer_thread.join(timeout=2)  
             
-            # 使用锁保护文件状态检查和线程启动  
-            with self.new_data_lock:  
-                # Check if new data file is still valid  
-                if not self.new_data_fd or self.new_data_fd.closed:  
-                    logger.error("New data file descriptor is not available for restart")  
-                    return False  
-                
-                # 验证文件状态  
-                try:  
-                    current_pos = self.new_data_fd.tell()  
-                    self.new_data_fd.seek(0, 2)  
-                    file_size = self.new_data_fd.tell()  
-                    self.new_data_fd.seek(current_pos)  
-                    
-                    logger.info(f"Restarting producer at position: {current_pos}/{file_size}")  
-                    
-                    if current_pos >= file_size:  
-                        logger.info("At end of file, producer may not need restart")  
-                        return True  # 不是错误，只是到了文件末尾  
-                        
-                except Exception as e:  
-                    logger.error(f"Cannot determine file position: {e}")  
-                    return False  
-                
-                # Restart the thread  
-                self.new_data_producer_running.set()  
-                self.new_data_producer_thread = threading.Thread(  
-                    target=self._new_data_producer,  
-                    daemon=True  
-                )  
-                self.new_data_producer_thread.start()  
+            # 不要清理队列中的现有数据，让它们继续被消费  
+            # 只有在确实需要时才清理  
             
-            # Verify thread started (在锁外验证)  
+            # Check if new data file is still valid  
+            if not self.new_data_fd or self.new_data_fd.closed:  
+                logger.error("New data file descriptor is not available for restart")  
+                return False  
+            
+            # 保持当前文件位置，不要重置  
+            try:  
+                current_pos = self.new_data_fd.tell()  
+                self.new_data_fd.seek(0, 2)  
+                file_size = self.new_data_fd.tell()  
+                self.new_data_fd.seek(current_pos)  
+                
+                logger.info(f"Restarting producer at position: {current_pos}/{file_size}")  
+                
+                if current_pos >= file_size:  
+                    logger.info("At end of file, producer may not need restart")  
+                    return True  # 不是错误，只是到了文件末尾  
+                    
+            except Exception as e:  
+                logger.error(f"Cannot determine file position: {e}")  
+                return False  
+            
+            # Restart the thread  
+            self.new_data_producer_running.set()  
+            self.new_data_producer_thread = threading.Thread(  
+                target=self._new_data_producer,  
+                daemon=True  
+            )  
+            self.new_data_producer_thread.start()  
+            
+            # Verify thread started  
             time.sleep(0.1)  
             is_alive = self.new_data_producer_thread.is_alive()  
             
@@ -670,62 +364,102 @@ class BlockImageUpdate:
             return False
 
       
-    def __enter__(self) -> Self:    
-        """Enhanced context manager entry"""    
-        logger.info("Initializing BlockImageUpdate")    
-            
-        # Platform-specific warnings    
-        if os.name == 'nt':    
-            logger.warning("Running on Windows - some operations may require administrator privileges")    
-            
-        # Check patch stream    
-        if self.patch_data_path.exists() and self.patch_data_path.stat().st_size == 0:    
-            self.patch_stream_empty = True    
-            logger.info("Patch stream is empty, will skip erase and zero commands")    
-            self._create_empty_block_device_file()    
-            
-        try:    
-            # Create stash directory and set up cache  
-            self.stash_base_dir.mkdir(parents=True, exist_ok=True)    
-            self.stash_cache.set_disk_cache_dir(self.stash_base_dir)  
-            
-            # Open new data file with memory mapping if possible    
-            if self.new_data_path.exists():    
-                logger.info(f"Opening new data file: {self.new_data_path}")    
-                self.new_data_fd = self.new_data_path.open('rb')    
-                logger.info(f"New data file size: {self.new_data_path.stat().st_size} bytes")    
-                    
-                # Start producer thread    
-                self.new_data_producer_running.set()    
-                self.new_data_producer_thread = threading.Thread(    
-                    target=self._new_data_producer,    
-                    daemon=True    
-                )    
-                self.new_data_producer_thread.start()    
-                    
-                # Verify thread started    
-                time.sleep(0.1)    
-                if not self.new_data_producer_thread.is_alive():    
-                    raise RuntimeError("Failed to start new data producer thread")    
-                logger.info("New data producer thread started successfully")    
-                
-            # Open patch data with memory mapping for better performance    
-            if self.patch_data_path.exists():    
-                self.patch_data_fd = self.patch_data_path.open('rb')    
-                try:    
-                    self.patch_data_mmap = mmap.mmap(    
-                        self.patch_data_fd.fileno(), 0, access=mmap.ACCESS_READ    
-                    )    
-                    logger.info("Patch data memory-mapped successfully")    
-                except (OSError, ValueError):    
-                    logger.warning("Failed to memory-map patch data, using regular file I/O")    
-                
-        except Exception as e:    
-            logger.error(f"Failed to initialize: {e}")    
-            raise    
-            
-        return self
-
+    def __enter__(self) -> Self:  
+        """Enhanced context manager entry"""  
+        logger.info("Initializing BlockImageUpdate")  
+          
+        # Platform-specific warnings  
+        if os.name == 'nt':  
+            logger.warning("Running on Windows - some operations may require administrator privileges")  
+          
+        # Check patch stream  
+        if self.patch_data_path.exists() and self.patch_data_path.stat().st_size == 0:  
+            self.patch_stream_empty = True  
+            logger.info("Patch stream is empty, will skip erase and zero commands")  
+            self._create_empty_block_device_file()  
+          
+        try:  
+            # Open new data file with memory mapping if possible  
+            if self.new_data_path.exists():  
+                logger.info(f"Opening new data file: {self.new_data_path}")  
+                self.new_data_fd = self.new_data_path.open('rb')  
+                logger.info(f"New data file size: {self.new_data_path.stat().st_size} bytes")  
+                  
+                # Start producer thread  
+                self.new_data_producer_running.set()  
+                self.new_data_producer_thread = threading.Thread(  
+                    target=self._new_data_producer,  
+                    daemon=True  
+                )  
+                self.new_data_producer_thread.start()  
+                  
+                # Verify thread started  
+                time.sleep(0.1)  
+                if not self.new_data_producer_thread.is_alive():  
+                    raise RuntimeError("Failed to start new data producer thread")  
+                logger.info("New data producer thread started successfully")  
+              
+            # Open patch data with memory mapping for better performance  
+            if self.patch_data_path.exists():  
+                self.patch_data_fd = self.patch_data_path.open('rb')  
+                try:  
+                    self.patch_data_mmap = mmap.mmap(  
+                        self.patch_data_fd.fileno(), 0, access=mmap.ACCESS_READ  
+                    )  
+                    logger.info("Patch data memory-mapped successfully")  
+                except (OSError, ValueError):  
+                    logger.warning("Failed to memory-map patch data, using regular file I/O")  
+              
+            # Create stash directory  
+            self.stash_base_dir.mkdir(parents=True, exist_ok=True)  
+              
+        except Exception as e:  
+            logger.error(f"Failed to initialize: {e}")  
+            raise  
+          
+        return self  
+    def __exit__(self, exc_type, exc_val, exc_tb):  
+        """Enhanced cleanup with proper resource management"""  
+        logger.info("Cleaning up BlockImageUpdate resources")  
+          
+        # Stop producer thread  
+        if self.new_data_producer_thread and self.new_data_producer_thread.is_alive():  
+            self.new_data_producer_running.clear()  
+            with self.new_data_condition:  
+                self.new_data_condition.notify_all()  
+            self.new_data_producer_thread.join(timeout=5)  
+          
+        # Close file descriptors and memory maps  
+        with suppress(AttributeError, OSError):  
+            if self.patch_data_mmap:  
+                self.patch_data_mmap.close()  
+                self.patch_data_mmap = None  
+          
+        with suppress(AttributeError, OSError):  
+            if self.new_data_fd:  
+                self.new_data_fd.close()  
+                self.new_data_fd = None  
+          
+        with suppress(AttributeError, OSError):  
+            if self.patch_data_fd:  
+                self.patch_data_fd.close()  
+                self.patch_data_fd = None  
+          
+        # Clean up progress checkpoint on normal completion  
+        if exc_type is None:  
+            self._cleanup_progress_checkpoint()  
+          
+        # Cleanup stash  
+        self._cleanup_stash()  
+          
+        # Clear queue  
+        with suppress(Exception):  
+            while not self.new_data_queue.empty():  
+                try:  
+                    self.new_data_queue.get_nowait()  
+                    self.new_data_queue.task_done()  
+                except queue.Empty:  
+                    break  
   
     def _create_empty_block_device_file(self):  
         """Create empty block device file when patch.dat is empty"""  
@@ -743,29 +477,15 @@ class BlockImageUpdate:
             raise  
   
     def _cleanup_stash(self):  
-        """Clean up stash files and directory with LRU cache cleanup"""  
+        """Clean up stash files and directory"""  
         try:  
-            # Clear the LRU cache first  
-            self.stash_cache.clear()  
-            logger.info("Stash cache cleared")  
-            
-            # Clean up any remaining files in stash directory  
             if self.stash_base_dir.exists():  
                 for file_path in self.stash_base_dir.iterdir():  
-                    try:  
-                        file_path.unlink()  
-                    except Exception as e:  
-                        logger.warning(f"Failed to remove stash file {file_path}: {e}")  
-                
-                try:  
-                    self.stash_base_dir.rmdir()  
-                    logger.info("Stash directory cleaned up")  
-                except OSError as e:  
-                    logger.warning(f"Failed to remove stash directory: {e}")  
-                    
+                    file_path.unlink()  
+                self.stash_base_dir.rmdir()  
+                logger.info("Stash directory cleaned up")  
         except Exception as e:  
-            logger.warning(f"Failed to cleanup stash: {e}")
-
+            logger.warning(f"Failed to cleanup stash: {e}")  
   
     def _cleanup_progress_checkpoint(self):  
         """Clean up progress checkpoint file after successful completion"""  
@@ -811,27 +531,24 @@ class BlockImageUpdate:
             return -1  
   
     def perform_command_new(self, tokens: List[str], pos: int) -> int:  
-        """Write new data with performance monitoring integration"""  
+        """Write new data to specified blocks using RangeSink with thread recovery"""  
         if pos >= len(tokens):  
             logger.error("Missing target blocks for new")  
             return -1  
-        
+    
         try:  
             rangeset = RangeSet(tokens[pos])  
             logger.info(f"Writing {rangeset.size} blocks of new data")  
-            
-            # 性能监控：数据处理开始  
-            start_time = time.time()  
-            
-            # 检查生产者线程状态  
+    
+            # 移除严格的文件大小检查，因为生产者线程会动态读取数据  
+            # 只检查生产者线程状态  
             if not self.new_data_producer_thread or not self.new_data_producer_thread.is_alive():  
                 logger.warning("Producer thread not running, attempting to restart")  
-                self._update_performance_stats('threading', 'producer_restart')  
                 if not self._restart_producer_thread():  
                     logger.error("Failed to restart producer thread")  
                     return -1  
-            
-            # 自动扩展块设备  
+    
+            # Auto-expand block device if needed  
             max_block_needed = max(end for _, end in rangeset)  
             required_device_size = max_block_needed * self.BLOCKSIZE  
             
@@ -843,13 +560,11 @@ class BlockImageUpdate:
                     padding_needed = required_device_size - current_device_size  
                     f.write(b'\x00' * padding_needed)  
                     f.flush()  
-            
+    
             with self._open_block_device('r+b') as f:  
                 range_sink = RangeSinkState(rangeset, f, self.BLOCKSIZE)  
                 
                 blocks_to_write = rangeset.size  
-                bytes_written = 0  
-                
                 for _ in range(blocks_to_write):  
                     try:  
                         data = self.new_data_queue.get(timeout=60)  
@@ -865,30 +580,18 @@ class BlockImageUpdate:
                             logger.error(f"Short write: expected {self.BLOCKSIZE}, got {written}")  
                             return -1  
                         
-                        bytes_written += written  
                         self.new_data_queue.task_done()  
                         
                     except queue.Empty:  
                         logger.error("Timeout waiting for new data")  
-                        self._update_performance_stats('threading', 'queue_overflow')  
                         return -1  
-            
-            # 性能监控：数据处理完成  
-            duration = time.time() - start_time  
-            if hasattr(self, '_update_performance_stats'):  
-                self._update_performance_stats('data', 'blocks_written', blocks=rangeset.size)  
-                self._update_performance_stats('data', 'bytes_transferred', bytes=bytes_written)  
-                self._update_performance_stats('io', 'write', bytes=bytes_written, duration=duration)  
-            
+    
             self.written += rangeset.size  
             return 0  
-        
+    
         except Exception as e:  
             logger.error(f"Failed to write new data: {e}")  
-            if hasattr(self, '_update_performance_stats'):  
-                self._update_performance_stats('error', error_type='new_command_failed')  
             return -1
-
 
 
   
@@ -926,178 +629,143 @@ class BlockImageUpdate:
             return -1  
   
   
-    def perform_command_diff(self, tokens: List[str], pos: int, cmd_name: str) -> int:    
-        """Apply diff patches with thread-safe patch data access"""    
-        if pos + 1 >= len(tokens):    
-            logger.error(f"Missing patch offset or length for {cmd_name}")    
-            return -1    
+    def perform_command_diff(self, tokens: List[str], pos: int, cmd_name: str) -> int:  
+        """Apply diff patches with memory-mapped patch data - Enhanced for V4 compatibility"""  
+        if pos + 1 >= len(tokens):  
+            logger.error(f"Missing patch offset or length for {cmd_name}")  
+            return -1  
     
-        try:    
-            offset = int(tokens[pos])    
-            length = int(tokens[pos + 1])    
-            pos += 2    
+        try:  
+            offset = int(tokens[pos])  
+            length = int(tokens[pos + 1])  
+            pos += 2  
     
-            # Parse based on transfer list version    
-            if self.version >= 3:    
-                if pos + 4 >= len(tokens):    
-                    logger.error("Missing required parameters for version 3+ diff")    
-                    return -1    
+            # Parse based on transfer list version  
+            if self.version >= 3:  
+                if pos + 4 >= len(tokens):  
+                    logger.error("Missing required parameters for version 3+ diff")  
+                    return -1  
                 
-                src_hash = tokens[pos]    
-                tgt_hash = tokens[pos + 1]    
-                tgt_range = tokens[pos + 2]    
-                src_blocks = int(tokens[pos + 3])    
-                pos += 4    
+                src_hash = tokens[pos]  
+                tgt_hash = tokens[pos + 1]  
+                tgt_range = tokens[pos + 2]  
+                src_blocks = int(tokens[pos + 3])  
+                pos += 4  
     
-                tgt_rangeset = RangeSet(tgt_range)    
+                tgt_rangeset = RangeSet(tgt_range)  
                 
-                # Load source data using version 3 loader    
-                try:    
-                    _, src_data, _, _ = self._load_src_tgt_version3(tokens, pos - 4, onehash=False)    
-                except Exception as e:    
-                    logger.error(f"Failed to load source data: {e}")    
-                    return -1    
+                # Load source data using version 3 loader  
+                try:  
+                    _, src_data, _, _ = self._load_src_tgt_version3(tokens, pos - 4, onehash=False)  
+                except Exception as e:  
+                    logger.error(f"Failed to load source data: {e}")  
+                    return -1  
                     
-            else:    
-                # Version 1/2 handling    
-                if pos + 1 >= len(tokens):    
-                    logger.error("Missing target/source ranges for version 1/2 diff")    
-                    return -1    
+            else:  
+                # Version 1/2 handling  
+                if pos + 1 >= len(tokens):  
+                    logger.error("Missing target/source ranges for version 1/2 diff")  
+                    return -1  
                     
-                tgt_rangeset = RangeSet(tokens[pos])    
-                src_rangeset = RangeSet(tokens[pos + 1])    
-                src_data = self._read_blocks(src_rangeset)    
-                tgt_hash = None    
+                tgt_rangeset = RangeSet(tokens[pos])  
+                src_rangeset = RangeSet(tokens[pos + 1])  
+                src_data = self._read_blocks(src_rangeset)  
+                tgt_hash = None  
                 
-                if src_data is None:    
-                    logger.error("Failed to read source blocks")    
-                    return -1    
+                if src_data is None:  
+                    logger.error("Failed to read source blocks")  
+                    return -1  
     
-            # 使用锁保护补丁数据访问  
-            with self.patch_data_lock:  
-                # Extract patch data using memory mapping if available    
-                if self.patch_data_mmap:    
-                    patch_data = bytes(self.patch_data_mmap[offset:offset + length])    
-                else:    
-                    self.patch_data_fd.seek(offset)    
-                    patch_data = self.patch_data_fd.read(length)    
+            # Extract patch data using memory mapping if available  
+            if self.patch_data_mmap:  
+                patch_data = bytes(self.patch_data_mmap[offset:offset + length])  
+            else:  
+                self.patch_data_fd.seek(offset)  
+                patch_data = self.patch_data_fd.read(length)  
     
-            # Apply patch with proper error handling    
-            result = self._apply_patch_internal(src_data, patch_data, cmd_name, tgt_hash)    
-            if result is None:    
-                return -1    
+            # Apply patch with proper error handling  
+            result = self._apply_patch_internal(src_data, patch_data, cmd_name, tgt_hash)  
+            if result is None:  
+                return -1  
     
-            # Write result using RangeSink with proper block alignment    
-            if not self._write_blocks(tgt_rangeset, result):    
-                logger.error("Failed to write patched blocks")    
-                return -1    
+            # Write result using RangeSink with proper block alignment  
+            if not self._write_blocks(tgt_rangeset, result):  
+                logger.error("Failed to write patched blocks")  
+                return -1  
     
-            self.written += tgt_rangeset.size    
-            return 0    
+            self.written += tgt_rangeset.size  
+            return 0  
     
-        except Exception as e:    
-            logger.error(f"Failed to apply {cmd_name} patch: {e}")    
+        except Exception as e:  
+            logger.error(f"Failed to apply {cmd_name} patch: {e}")  
             return -1
 
+
     def _new_data_producer(self):  
-        """Thread-safe producer thread with improved synchronization and error handling"""  
+        """Optimized producer thread with better buffering and error recovery"""  
         logger.info("New data producer thread starting")  
         buffer_size = self.BLOCKSIZE * 10  
-        consecutive_errors = 0  
-        max_consecutive_errors = 3  
-          
+        
         try:  
             while self.new_data_producer_running.is_set():  
                 try:  
-                    # 使用锁保护整个文件操作序列  
-                    with self.new_data_lock:  
-                        # Check if file descriptor is still valid  
-                        if not self.new_data_fd or self.new_data_fd.closed:  
-                            logger.error("New data file descriptor is closed")  
-                            break  
-                          
-                        # 原子性地检查位置和读取数据  
-                        current_pos = self.new_data_fd.tell()  
-                        self.new_data_fd.seek(0, 2)  # Seek to end  
-                        file_size = self.new_data_fd.tell()  
-                        self.new_data_fd.seek(current_pos)  # Restore position  
-                          
-                        if current_pos >= file_size:  
-                            logger.info("Reached end of new data file")  
-                            # 确保EOF信号被正确发送  
-                            try:  
-                                self.new_data_queue.put(None, timeout=1)  
-                            except queue.Full:  
-                                logger.warning("Queue full when sending EOF signal")  
-                            break  
-                          
-                        # 在锁内完成读取操作  
-                        data = self.new_data_fd.read(buffer_size)  
-                        if not data:  
-                            logger.info("No more data available, sending EOF signal")  
-                            try:  
-                                self.new_data_queue.put(None, timeout=1)  
-                            except queue.Full:  
-                                logger.warning("Queue full when sending EOF signal")  
-                            break  
-                      
-                    # 在锁外处理数据，避免长时间持有锁  
+                    # Check if file descriptor is still valid  
+                    if not self.new_data_fd or self.new_data_fd.closed:  
+                        logger.error("New data file descriptor is closed")  
+                        break  
+                    
+                    # Check current position and file size  
+                    current_pos = self.new_data_fd.tell()  
+                    self.new_data_fd.seek(0, 2)  # Seek to end  
+                    file_size = self.new_data_fd.tell()  
+                    self.new_data_fd.seek(current_pos)  # Restore position  
+                    
+                    if current_pos >= file_size:  
+                        logger.info("Reached end of new data file")  
+                        self.new_data_queue.put(None)  # EOF signal  
+                        break  
+                    
+                    data = self.new_data_fd.read(buffer_size)  
+                    if not data:  
+                        logger.info("No more data available, sending EOF signal")  
+                        self.new_data_queue.put(None)  # EOF signal  
+                        break  
+                    
                     # Split into individual blocks  
                     for i in range(0, len(data), self.BLOCKSIZE):  
                         if not self.new_data_producer_running.is_set():  
                             break  
-                          
+                        
                         block = data[i:i + self.BLOCKSIZE]  
                         if len(block) < self.BLOCKSIZE:  
                             block = block.ljust(self.BLOCKSIZE, b'\x00')  
-                          
-                        # 修复：使用更安全的队列操作  
-                        retry_count = 0  
-                        max_retries = 3  
-                        while retry_count < max_retries:  
-                            try:  
-                                self.new_data_queue.put(block, timeout=2)  
-                                break  
-                            except queue.Full:  
-                                retry_count += 1  
-                                if retry_count >= max_retries:  
-                                    logger.error("Failed to put data in queue after retries")  
-                                    return  
-                                logger.warning(f"Queue full, retry {retry_count}/{max_retries}")  
-                                time.sleep(0.1 * retry_count)  
-                          
+                        
+                        # Use timeout to avoid blocking indefinitely  
+                        try:  
+                            self.new_data_queue.put(block, timeout=5)  
+                        except queue.Full:  
+                            logger.warning("New data queue is full, producer may be blocked")  
+                            continue  
+                        
                         with self.new_data_condition:  
                             self.new_data_condition.notify_all()  
-                      
-                    # 重置错误计数器  
-                    consecutive_errors = 0  
-                      
+                    
                 except (IOError, OSError) as e:  
-                    consecutive_errors += 1  
-                    logger.error(f"Producer I/O error (attempt {consecutive_errors}): {e}")  
-                    if consecutive_errors >= max_consecutive_errors:  
-                        logger.error("Too many consecutive I/O errors, stopping producer")  
-                        break  
-                    time.sleep(0.5 * consecutive_errors)  # 指数退避  
-                      
+                    logger.error(f"Producer I/O error: {e}")  
+                    break  
                 except Exception as e:  
-                    consecutive_errors += 1  
-                    logger.error(f"Producer unexpected error (attempt {consecutive_errors}): {e}")  
-                    if consecutive_errors >= max_consecutive_errors:  
-                        logger.error("Too many consecutive errors, stopping producer")  
-                        break  
-                    time.sleep(0.5 * consecutive_errors)  
-                      
+                    logger.error(f"Producer unexpected error: {e}")  
+                    break  
+                    
         except Exception as e:  
             logger.error(f"Producer fatal error: {e}")  
         finally:  
-            # 确保EOF信号被发送  
+            # Signal EOF and cleanup  
             try:  
-                self.new_data_queue.put(None, timeout=1)  
+                self.new_data_queue.put(None)  
             except:  
                 pass  
-            logger.info("New data producer thread terminating")
-
+            logger.info("New data producer thread terminating") 
   
     def _apply_patch_internal(self, src_data: bytes, patch_data: bytes,     
                             cmd_name: str, expected_tgt_hash: str) -> Optional[bytes]:    
@@ -1195,161 +863,115 @@ class BlockImageUpdate:
           
         return src_data_len  
   
-    def perform_command_stash(self, tokens: List[str], pos: int) -> int:    
-        """Stash blocks for later use with LRU cache management"""    
-        if pos + 1 >= len(tokens):    
-            logger.error("Missing stash id or range for stash")    
-            return -1    
-                
-        try:    
-            stash_id = tokens[pos]    
-            rangeset = RangeSet(tokens[pos + 1])    
-                
-            logger.info(f"Stashing {rangeset.size} blocks as {stash_id}")    
-                
-            # Read blocks to stash    
-            stash_data = self._read_blocks(rangeset)    
-            if stash_data is None:    
-                return -1    
-                
-            # Store in LRU cache (handles both memory and disk automatically)  
-            self.stash_cache.put(stash_id, stash_data)  
-            
-            # Log cache statistics periodically  
-            if logger.isEnabledFor(logging.DEBUG):  
-                stats = self.stash_cache.get_memory_usage()  
-                logger.debug(f"Stash cache stats: {stats}")  
-                
-            return 0    
-                
-        except Exception as e:    
-            logger.error(f"Failed to stash blocks: {e}")    
-            return -1
-
+    def perform_command_stash(self, tokens: List[str], pos: int) -> int:  
+        """Stash blocks for later use with enhanced error handling"""  
+        if pos + 1 >= len(tokens):  
+            logger.error("Missing stash id or range for stash")  
+            return -1  
+              
+        try:  
+            stash_id = tokens[pos]  
+            rangeset = RangeSet(tokens[pos + 1])  
+              
+            logger.info(f"Stashing {rangeset.size} blocks as {stash_id}")  
+              
+            # Read blocks to stash  
+            stash_data = self._read_blocks(rangeset)  
+            if stash_data is None:  
+                return -1  
+              
+            # Store in memory and on disk  
+            self.stash_map[stash_id] = stash_data  
+              
+            # Save to disk for persistence  
+            stash_file = self.stash_base_dir / f"stash_{stash_id}"  
+            stash_file.write_bytes(stash_data)  
+              
+            return 0  
+              
+        except Exception as e:  
+            logger.error(f"Failed to stash blocks: {e}")  
+            return -1  
   
-    def perform_command_free(self, tokens: List[str], pos: int) -> int:    
-        """Free stashed data with LRU cache cleanup"""    
-        if pos >= len(tokens):    
-            logger.error("Missing stash id for free")    
-            return -1    
-                
-        stash_id = tokens[pos]    
-        
-        # Remove from LRU cache (handles both memory and disk)  
-        self.stash_cache.remove(stash_id)  
-        logger.info(f"Freed stash {stash_id}")  
-            
-        return 0
-
+    def perform_command_free(self, tokens: List[str], pos: int) -> int:  
+        """Free stashed data with enhanced cleanup"""  
+        if pos >= len(tokens):  
+            logger.error("Missing stash id for free")  
+            return -1  
+              
+        stash_id = tokens[pos]  
+          
+        # Remove from memory  
+        if stash_id in self.stash_map:  
+            del self.stash_map[stash_id]  
+            logger.info(f"Freed stash {stash_id}")  
+        else:  
+            logger.warning(f"Stash {stash_id} not found (already freed?)")  
+          
+        # Remove from disk  
+        stash_file = self.stash_base_dir / f"stash_{stash_id}"  
+        with suppress(FileNotFoundError):  
+            stash_file.unlink()  
+          
+        return 0  
   
     def _read_blocks(self, rangeset: RangeSet) -> Optional[bytes]:  
-        """Read blocks with async optimization for large files"""  
+        """Read blocks from block device with streaming optimization"""  
         try:  
-            # 对于大文件使用异步处理  
-            if self.large_file_config.enable_streaming and rangeset.size > 256:  # >1MB  
-                return asyncio.run(self._read_blocks_async(rangeset))  
-            else:  
-                return self._read_blocks_sync(rangeset)  
+            data = bytearray()  
+              
+            with self._open_block_device('rb') as f:  
+                for start_block, end_block in rangeset:  
+                    f.seek(start_block * self.BLOCKSIZE)  
+                      
+                    # Read in chunks for better performance  
+                    remaining_blocks = end_block - start_block  
+                    while remaining_blocks > 0:  
+                        chunk_blocks = min(remaining_blocks, 256)  # 1MB chunks  
+                        chunk_size = chunk_blocks * self.BLOCKSIZE  
+                          
+                        chunk_data = f.read(chunk_size)  
+                        if len(chunk_data) != chunk_size:  
+                            logger.error(f"Short read: expected {chunk_size}, got {len(chunk_data)}")  
+                            return None  
+                          
+                        data.extend(chunk_data)  
+                        remaining_blocks -= chunk_blocks  
+              
+            return bytes(data)  
+              
         except Exception as e:  
             logger.error(f"Failed to read blocks: {e}")  
             return None  
-    
-    async def _read_blocks_async(self, rangeset: RangeSet) -> bytes:  
-        """Async version of block reading"""  
-        async_processor = AsyncBlockProcessor(self.BLOCKSIZE)  
-        
-        with self._open_block_device('rb') as f:  
-            return await async_processor.read_blocks_async(f, rangeset)  
   
-    def _read_blocks_sync(self, rangeset: RangeSet) -> bytes:  
-        """Synchronous version for small files"""  
-        data = bytearray()  
-        
-        with self._open_block_device('rb') as f:  
-            for start_block, end_block in rangeset:  
-                f.seek(start_block * self.BLOCKSIZE)  
-                
-                # 使用内存管理的分块读取  
-                remaining_blocks = end_block - start_block  
-                while remaining_blocks > 0:  
-                    chunk_blocks = min(remaining_blocks, self.large_file_config.chunk_size_mb * 256)  
-                    chunk_size = chunk_blocks * self.BLOCKSIZE  
-                    
-                    chunk_data = f.read(chunk_size)  
-                    if len(chunk_data) != chunk_size:  
-                        logger.error(f"Short read: expected {chunk_size}, got {len(chunk_data)}")  
-                        return None  
-                    
-                    data.extend(chunk_data)  
-                    remaining_blocks -= chunk_blocks  
-                    
-                    # 定期进行内存管理  
-                    self._manage_memory()  
-        
-        return bytes(data)
-
-
     def _write_blocks(self, rangeset: RangeSet, data: bytes) -> bool:  
-        """Write blocks with async optimization for large files"""  
-        try:  
-            # 对于大文件使用异步处理  
-            if self.large_file_config.enable_streaming and len(data) > 1024 * 1024:  # >1MB  
-                return asyncio.run(self._write_blocks_async(rangeset, data))  
-            else:  
-                return self._write_blocks_sync(rangeset, data)  
-        except Exception as e:  
-            logger.error(f"Failed to write blocks: {e}")  
-            return False  
-    
-    async def _write_blocks_async(self, rangeset: RangeSet, data: bytes) -> bool:  
-        """Async version of block writing"""  
-        async_processor = AsyncBlockProcessor(self.BLOCKSIZE)  
-        
-        with self._open_block_device('r+b') as f:  
-            success = await async_processor.write_blocks_async(f, rangeset, data)  
-            
-            if success:  
-                # 异步同步  
-                loop = asyncio.get_event_loop()  
-                if self.io_settings.sync_method == 'fsync':  
-                    await loop.run_in_executor(None, lambda: os.fsync(f.fileno()))  
-                else:  
-                    await loop.run_in_executor(None, f.flush)  
-            
-            return success  
-    
-    def _write_blocks_sync(self, rangeset: RangeSet, data: bytes) -> bool:  
-        """Synchronous version for small files"""  
+        """Write data to blocks using RangeSink for precision"""  
         try:  
             with self._open_block_device('r+b') as f:  
                 range_sink = RangeSinkState(rangeset, f, self.BLOCKSIZE)  
-                
+                  
                 data_offset = 0  
                 while data_offset < len(data):  
                     chunk = data[data_offset:data_offset + self.BLOCKSIZE]  
                     if len(chunk) < self.BLOCKSIZE:  
                         chunk = chunk.ljust(self.BLOCKSIZE, b'\x00')  
-                    
+                      
                     written = range_sink.write(chunk)  
                     if written == 0:  
                         break  
                     data_offset += written  
-                    
-                    # 定期进行内存管理  
-                    if data_offset % (self.large_file_config.chunk_size_mb * 1024 * 1024) == 0:  
-                        self._manage_memory()  
-                
-                # 同步  
+                  
+                # Sync based on platform settings  
                 if self.io_settings.sync_method == 'fsync':  
                     os.fsync(f.fileno())  
                 else:  
                     f.flush()  
-            
+              
             return True  
+              
         except Exception as e:  
-            logger.error(f"Failed to write blocks sync: {e}")  
-            return False
-
+            logger.error(f"Failed to write blocks: {e}")  
+            return False  
   
     def _load_src_tgt_version1(self, tokens: List[str], pos: int) -> Tuple[RangeSet, bytes, int]:  
         """Load source/target for version 1 commands"""  
@@ -1365,62 +987,60 @@ class BlockImageUpdate:
           
         return tgt_rangeset, src_data, src_rangeset.size  
   
-    def _load_src_tgt_version2(self, tokens: List[str], pos: int) -> Tuple[RangeSet, bytes, int, bool]:    
-        """Load source/target for version 2 commands - returns bytes consistently"""    
-        if pos + 2 >= len(tokens):    
-            raise ValueError("Invalid parameters for version 2 load")    
+    def _load_src_tgt_version2(self, tokens: List[str], pos: int) -> Tuple[RangeSet, bytearray, int, bool]:  
+        """Load source/target for version 2 commands"""  
+        if pos + 2 >= len(tokens):  
+            raise ValueError("Invalid parameters for version 2 load")  
     
-        tgt_rangeset = RangeSet(tokens[pos])    
-        src_block_count = int(tokens[pos + 1])    
+        tgt_rangeset = RangeSet(tokens[pos])  
+        src_block_count = int(tokens[pos + 1])  
         
-        # Initialize buffer with exact expected size    
-        src_data = bytearray(src_block_count * self.BLOCKSIZE)    
-        overlap = False    
-        cur = pos + 2    
+        # Initialize buffer with exact expected size  
+        src_data = bytearray(src_block_count * self.BLOCKSIZE)  
+        overlap = False  
+        cur = pos + 2  
     
-        if tokens[cur] == "-":    
-            cur += 1  # No source range, only stashes    
-        else:    
-            src_rangeset = RangeSet(tokens[cur])    
-            read_data = self._read_blocks(src_rangeset)    
-            if read_data is None:    
-                raise IOError("Failed to read source blocks for version 2")    
+        if tokens[cur] == "-":  
+            cur += 1  # No source range, only stashes  
+        else:  
+            src_rangeset = RangeSet(tokens[cur])  
+            read_data = self._read_blocks(src_rangeset)  
+            if read_data is None:  
+                raise IOError("Failed to read source blocks for version 2")  
             
-            copy_size = min(len(read_data), len(src_data))    
-            src_data[:copy_size] = read_data[:copy_size]    
+            copy_size = min(len(read_data), len(src_data))  
+            src_data[:copy_size] = read_data[:copy_size]  
             
-            if len(read_data) > len(src_data):    
-                logger.warning(f"Truncating read data from {len(read_data)} to {len(src_data)} bytes to match src_block_count")    
+            if len(read_data) > len(src_data):  
+                logger.warning(f"Truncating read data from {len(read_data)} to {len(src_data)} bytes to match src_block_count")  
             
-            overlap = self._range_overlaps(src_rangeset, tgt_rangeset)    
-            cur += 1    
+            overlap = self._range_overlaps(src_rangeset, tgt_rangeset)  
+            cur += 1  
             
-            # Optional source location mapping    
-            if cur < len(tokens) and ':' not in tokens[cur]:    
-                locs_rangeset = RangeSet(tokens[cur])    
-                self._move_range(src_data, locs_rangeset, src_data[:copy_size])    
-                cur += 1    
+            # Optional source location mapping  
+            if cur < len(tokens) and ':' not in tokens[cur]:  
+                locs_rangeset = RangeSet(tokens[cur])  
+                self._move_range(src_data, locs_rangeset, src_data[:copy_size])  
+                cur += 1  
     
-        # Handle stashes and ensure consistent return type  
-        while cur < len(tokens):    
-            stash_spec = tokens[cur]    
-            if ':' in stash_spec:    
-                # Apply stash and update src_data with the returned buffer    
-                src_data = self._apply_stash_data(src_data, stash_spec)    
-                # Ensure src_data is still the correct type and size    
-                if not isinstance(src_data, bytearray):    
-                    src_data = bytearray(src_data)    
-                if len(src_data) != src_block_count * self.BLOCKSIZE:    
-                    logger.warning(f"Stash application changed buffer size from {src_block_count * self.BLOCKSIZE} to {len(src_data)}")    
-            cur += 1    
+        # CRITICAL FIX: Handle stashes and update src_data reference  
+        while cur < len(tokens):  
+            stash_spec = tokens[cur]  
+            if ':' in stash_spec:  
+                # Apply stash and update src_data with the returned buffer  
+                src_data = self._apply_stash_data(src_data, stash_spec)  
+                # Ensure src_data is still the correct type and size  
+                if not isinstance(src_data, bytearray):  
+                    src_data = bytearray(src_data)  
+                if len(src_data) != src_block_count * self.BLOCKSIZE:  
+                    logger.warning(f"Stash application changed buffer size from {src_block_count * self.BLOCKSIZE} to {len(src_data)}")  
+            cur += 1  
     
-        # Convert to bytes for consistent return type  
-        return tgt_rangeset, bytes(src_data), src_block_count, overlap
-
+        return tgt_rangeset, src_data, src_block_count, overlap
     
     def _load_src_tgt_version3(self, tokens: List[str], pos: int, onehash: bool) -> Tuple[RangeSet, bytearray, int, bool]:  
         """  
-        Parse and load source/target for version 3+ commands with LRU cache support.  
+        Parse and load source/target for version 3+ commands.  
         Returns: (tgt_rangeset, src_data, src_block_count, overlap)  
         """  
         if pos >= len(tokens):  
@@ -1443,9 +1063,9 @@ class BlockImageUpdate:
         actual_src_hash = hashlib.sha1(src_data).hexdigest()  
         if actual_src_hash != src_hash:  
             if overlap:  
-                # Try to recover from LRU cache  
-                recovered_data = self.stash_cache.get(src_hash)  
-                if recovered_data:  
+                # Try to recover from memory or disk stash  
+                if src_hash in self.stash_map:  
+                    recovered_data = self.stash_map[src_hash]  
                     # Ensure recovered data has the expected size  
                     if len(recovered_data) != src_block_count * self.BLOCKSIZE:  
                         raise ValueError(f"Recovered stash data size mismatch: expected {src_block_count * self.BLOCKSIZE}, got {len(recovered_data)}")  
@@ -1454,67 +1074,78 @@ class BlockImageUpdate:
                     if hashlib.sha1(src_data).hexdigest() != src_hash:  
                         raise ValueError("Partition has unexpected contents and stash recovery failed")  
                 else:  
-                    raise ValueError("Partition has unexpected contents")  
+                    # Try to load from disk  
+                    stash_file = self.stash_base_dir / f"stash_{src_hash}"  
+                    if stash_file.exists():  
+                        recovered_data = stash_file.read_bytes()  
+                        if len(recovered_data) != src_block_count * self.BLOCKSIZE:  
+                            raise ValueError(f"Recovered disk stash data size mismatch: expected {src_block_count * self.BLOCKSIZE}, got {len(recovered_data)}")  
+                        src_data = bytearray(recovered_data)  
+                        
+                        if hashlib.sha1(src_data).hexdigest() != src_hash:  
+                            raise ValueError("Partition has unexpected contents and disk stash recovery failed")  
+                    else:  
+                        raise ValueError("Partition has unexpected contents")  
             else:  
                 raise ValueError("Partition has unexpected contents")  
         else:  
             if overlap:  
-                # Proactively store in LRU cache  
-                self.stash_cache.put(src_hash, bytes(src_data))  
+                # Proactively write stash to disk  
+                self.stash_map[src_hash] = bytes(src_data)  
+                stash_file = self.stash_base_dir / f"stash_{src_hash}"  
+                stash_file.write_bytes(src_data)  
     
         return tgt_rangeset, src_data, src_block_count, overlap
-
-    
+  
     def _apply_stash_data(self, buffer: Union[bytearray, bytes], stash_spec: str):  
-        """Apply stashed data to buffer at specified ranges with LRU cache - fixed error handling"""  
+        """Apply stashed data to buffer at specified ranges"""  
         try:  
             stash_id, range_text = stash_spec.split(':', 1)  
-              
-            # Try to get from LRU cache  
-            stash_data = self.stash_cache.get(stash_id)  
-              
-            # 修复：更严格的错误处理，与C++版本一致  
-            if stash_data is None:  
-                logger.error(f"Stash ID {stash_id} not found in cache - this is a critical error")  
-                raise ValueError(f"Required stash data {stash_id} is missing")  
-  
+            
+            if stash_id not in self.stash_map:  
+                # Try loading from disk  
+                stash_file = self.stash_base_dir / f"stash_{stash_id}"  
+                if stash_file.exists():  
+                    stash_data = stash_file.read_bytes()  
+                    self.stash_map[stash_id] = stash_data  
+                else:  
+                    logger.warning(f"Stash ID {stash_id} not found")  
+                    return buffer if isinstance(buffer, bytearray) else bytearray(buffer)  
+    
+            stash_data = self.stash_map[stash_id]  
             locs = RangeSet(range_text)  
-  
+    
             # CRITICAL FIX: Ensure buffer is mutable (bytearray)  
             if isinstance(buffer, bytes):  
                 buffer = bytearray(buffer)  
             elif not isinstance(buffer, bytearray):  
                 buffer = bytearray(buffer)  
-  
-            # 验证stash数据大小  
-            expected_stash_size = locs.size * self.BLOCKSIZE  
-            if len(stash_data) != expected_stash_size:  
-                raise ValueError(f"Stash data size mismatch: expected {expected_stash_size}, got {len(stash_data)}")  
-  
+    
             current_offset = len(stash_data)  
             for start_block, end_block in reversed(locs.get_ranges()):  
                 num_blocks = end_block - start_block  
                 size_to_copy = num_blocks * self.BLOCKSIZE  
-                  
+                
                 current_offset -= size_to_copy  
                 if current_offset < 0:  
                     raise ValueError(f"Stash data too small for range {start_block}-{end_block}")  
-  
+    
                 buffer_start = start_block * self.BLOCKSIZE  
                 buffer_end = buffer_start + size_to_copy  
-                  
+                
                 if buffer_end > len(buffer):  
                     raise ValueError(f"Write beyond buffer bounds: {buffer_end} > {len(buffer)}")  
-  
+    
                 # Now safe to do slice assignment on bytearray  
                 buffer[buffer_start:buffer_end] = stash_data[current_offset:current_offset + size_to_copy]  
                 logger.debug(f"Applied stash {stash_id} to blocks {start_block}-{end_block}")  
-  
+    
             return buffer  
-  
+    
         except Exception as e:  
             logger.error(f"Failed to apply stash {stash_spec}: {e}")  
             raise
+
 
     def _move_range(self, dest: bytearray, locs: RangeSet, source: bytes):  
         """Move packed source data to locations in dest buffer"""  
@@ -1702,10 +1333,7 @@ class BlockImageUpdate:
         return False  
   
     def _process_commands(self, start_line: int) -> int:  
-        """Process transfer list commands with integrated performance monitoring"""  
-        # 初始化性能监控  
-        self._initialize_performance_monitoring()  
-        
+        """Process transfer list commands starting from given line"""  
         commands = {  
             'zero': lambda tokens, pos: self._handle_zero_command(tokens, pos),  
             'new': lambda tokens, pos: self.perform_command_new(tokens, pos),  
@@ -1716,44 +1344,34 @@ class BlockImageUpdate:
             'stash': lambda tokens, pos: self.perform_command_stash(tokens, pos),  
             'free': lambda tokens, pos: self.perform_command_free(tokens, pos),  
         }  
-        
+    
+        # 记录每种命令的失败次数  
         failed_command_counts = {}  
         total_failed = 0  
-        
+    
         for line_num in range(start_line, len(self.transfer_lines)):  
             line = self.transfer_lines[line_num].strip()  
             if not line:  
                 continue  
-            
+    
             tokens = line.split()  
             if not tokens:  
                 continue  
-            
+    
             cmd = tokens[0]  
             if cmd not in commands:  
                 logger.error(f"Unknown command: {cmd}")  
-                self._update_performance_stats('error', error_type='unknown_command')  
                 if not self.continue_on_error:  
                     return -1  
                 failed_command_counts[cmd] = failed_command_counts.get(cmd, 0) + 1  
                 total_failed += 1  
                 continue  
-            
+    
             logger.info(f"Executing: {cmd}")  
-            
-            # 性能监控：命令开始  
-            self._update_performance_stats('command', 'start', command=cmd)  
-            
             try:  
                 result = commands[cmd](tokens, 1)  
-                success = result == 0  
-                
-                # 性能监控：命令结束  
-                self._update_performance_stats('command', 'end', command=cmd, success=success)  
-                
                 if result != 0:  
                     logger.error(f"Command {cmd} failed with code {result}")  
-                    self._update_performance_stats('error', error_type='command_failed')  
                     if self.continue_on_error:  
                         logger.warning(f"Continuing execution despite error in {cmd} command")  
                         failed_command_counts[cmd] = failed_command_counts.get(cmd, 0) + 1  
@@ -1761,21 +1379,12 @@ class BlockImageUpdate:
                         continue  
                     else:  
                         return result  
-                
-                # 更新进度和保存检查点  
+    
+                # Update progress and save checkpoint if needed  
                 self._update_and_save_progress(line_num, cmd)  
-                
-                # 定期内存管理和性能报告  
-                if line_num % 20 == 0:  # 每20个命令  
-                    self._manage_memory()  
-                    if logger.isEnabledFor(logging.INFO):  
-                        self._log_performance_summary()  
-            
+    
             except Exception as e:  
                 logger.error(f"Exception executing command {cmd}: {e}")  
-                self._update_performance_stats('command', 'end', command=cmd, success=False)  
-                self._update_performance_stats('error', error_type='command_exception')  
-                
                 if self.continue_on_error:  
                     logger.warning(f"Continuing execution despite exception in {cmd} command")  
                     failed_command_counts[cmd] = failed_command_counts.get(cmd, 0) + 1  
@@ -1783,19 +1392,12 @@ class BlockImageUpdate:
                     continue  
                 else:  
                     return -1  
-        
-        # 最终性能报告  
-        self._log_performance_summary()  
-        report_file = self._save_performance_report()  
-        if report_file:  
-            logger.info(f"Detailed performance report available at: {report_file}")  
-        
+    
         # 如果有失败的命令，将详细信息存储到实例变量中  
         if total_failed > 0:  
             self.failed_command_details = failed_command_counts  
         
-        return total_failed  
-
+        return total_failed
 
 
   
@@ -1837,970 +1439,7 @@ class BlockImageUpdate:
         }  
         progress_file = self.stash_base_dir / "progress.json"  
         progress_file.write_text(json.dumps(checkpoint, indent=2))  
-
-
-    def _manage_memory(self):  
-        """Enhanced memory management for large file processing with adaptive strategies"""  
-        current_time = time.time()  
-        
-        try:  
-            # 获取当前内存使用情况  
-            process = psutil.Process()  
-            memory_info = process.memory_info()  
-            memory_mb = memory_info.rss // (1024 * 1024)  
-            memory_percent = process.memory_percent()  
-            
-            # 更新流式处理状态  
-            self.streaming_state['memory_usage'] = memory_mb  
-            
-            # 定期垃圾回收策略  
-            gc_interval = self.large_file_config.gc_frequency  
-            if current_time - self._last_gc_time > gc_interval:  
-                # 根据内存压力调整垃圾回收强度  
-                if memory_percent > 80:  
-                    # 高内存压力：强制完整垃圾回收  
-                    collected = gc.collect()  
-                    gc.collect()  # 二次回收  
-                    logger.info(f"High memory pressure: collected {collected} objects (full GC)")  
-                elif memory_percent > 60:  
-                    # 中等内存压力：标准垃圾回收  
-                    collected = gc.collect()  
-                    logger.debug(f"Medium memory pressure: collected {collected} objects")  
-                else:  
-                    # 低内存压力：轻量垃圾回收  
-                    collected = gc.collect(0)  # 只回收第0代  
-                    if collected > 0:  
-                        logger.debug(f"Light GC: collected {collected} objects")  
-                
-                self._last_gc_time = current_time  
-            
-            # 内存压力检测和响应  
-            memory_limit = self.large_file_config.memory_limit_mb  
-            
-            if memory_mb > memory_limit:  
-                logger.warning(f"Memory limit exceeded: {memory_mb}MB > {memory_limit}MB ({memory_percent:.1f}%)")  
-                
-                # 分级内存清理策略  
-                if memory_percent > 90:  
-                    # 紧急情况：激进清理  
-                    self._emergency_memory_cleanup()  
-                elif memory_percent > 75:  
-                    # 严重情况：主动清理  
-                    self._aggressive_memory_cleanup()  
-                else:  
-                    # 一般情况：温和清理  
-                    self._gentle_memory_cleanup()  
-            
-            # 监控队列大小并调整  
-            queue_size = self.new_data_queue.qsize()  
-            if queue_size > self.new_data_queue.maxsize * 0.8:  
-                logger.debug(f"Queue nearly full: {queue_size}/{self.new_data_queue.maxsize}")  
-                
-            # 定期报告内存状态（调试模式）  
-            if logger.isEnabledFor(logging.DEBUG) and current_time % 30 < 1:  # 每30秒  
-                self._log_memory_stats(memory_mb, memory_percent)  
-                
-        except Exception as e:  
-            logger.warning(f"Memory management error: {e}")  
-    
-    def _emergency_memory_cleanup(self):  
-        """Emergency memory cleanup for critical memory pressure - fixed to avoid data loss"""  
-        logger.warning("Initiating emergency memory cleanup")  
-          
-        # 1. 清空大部分stash缓存  
-        if hasattr(self, 'stash_cache'):  
-            cache_items = list(self.stash_cache.cache.keys())  
-            items_to_remove = len(cache_items) * 3 // 4  # 清理75%  
-            for key in cache_items[:items_to_remove]:  
-                self.stash_cache.remove(key)  
-            logger.info(f"Emergency: cleared {items_to_remove} stash cache items")  
-          
-        # 2. 强制垃圾回收  
-        for i in range(3):  
-            collected = gc.collect()  
-            if collected == 0:  
-                break  
-          
-        # 3. 修复：不直接丢弃队列数据，而是暂停生产者  
-        if hasattr(self, 'new_data_producer_running'):  
-            # 暂时停止生产者以减少内存压力  
-            was_running = self.new_data_producer_running.is_set()  
-            if was_running:  
-                self.new_data_producer_running.clear()  
-                logger.warning("Emergency: temporarily stopped data producer")  
-                  
-                # 等待队列消费一些数据  
-                time.sleep(1)  
-                  
-                # 重新启动生产者  
-                if self.new_data_producer_thread and not self.new_data_producer_thread.is_alive():  
-                    self._restart_producer_thread()  
-                else:  
-                    self.new_data_producer_running.set()  
-                logger.info("Emergency: restarted data producer")
-
-    
-    def _aggressive_memory_cleanup(self):  
-        """Aggressive memory cleanup for high memory pressure"""  
-        logger.info("Initiating aggressive memory cleanup")  
-        
-        # 1. 清理一半的stash缓存  
-        if hasattr(self, 'stash_cache'):  
-            cache_items = list(self.stash_cache.cache.keys())  
-            items_to_remove = len(cache_items) // 2  
-            for key in cache_items[:items_to_remove]:  
-                self.stash_cache.remove(key)  
-            logger.info(f"Aggressive: cleared {items_to_remove} stash cache items")  
-        
-        # 2. 多次垃圾回收  
-        total_collected = 0  
-        for i in range(2):  
-            collected = gc.collect()  
-            total_collected += collected  
-            if collected == 0:  
-                break  
-        
-        if total_collected > 0:  
-            logger.info(f"Aggressive: collected {total_collected} objects")  
-    
-    def _gentle_memory_cleanup(self):  
-        """Gentle memory cleanup for moderate memory pressure"""  
-        logger.debug("Initiating gentle memory cleanup")  
-        
-        # 1. 清理部分stash缓存（只清理最老的）  
-        if hasattr(self, 'stash_cache'):  
-            stats = self.stash_cache.get_memory_usage()  
-            if stats['memory_mb'] > 50:  # 如果stash缓存超过50MB  
-                cache_items = list(self.stash_cache.cache.keys())  
-                items_to_remove = min(5, len(cache_items) // 4)  # 清理最多5个或25%  
-                for key in cache_items[:items_to_remove]:  
-                    self.stash_cache.remove(key)  
-                logger.debug(f"Gentle: cleared {items_to_remove} stash cache items")  
-        
-        # 2. 单次垃圾回收  
-        collected = gc.collect()  
-        if collected > 0:  
-            logger.debug(f"Gentle: collected {collected} objects")  
-    
-    def _log_memory_stats(self, memory_mb: int, memory_percent: float):  
-        """Log detailed memory statistics for debugging"""  
-        try:  
-            # 系统内存信息  
-            system_memory = psutil.virtual_memory()  
-            
-            # Stash缓存信息  
-            stash_stats = {}  
-            if hasattr(self, 'stash_cache'):  
-                stash_stats = self.stash_cache.get_memory_usage()  
-            
-            # 队列信息  
-            queue_size = self.new_data_queue.qsize()  
-            queue_max = self.new_data_queue.maxsize  
-            
-            # 流式处理状态  
-            streaming_info = self.streaming_state.copy()  
-            
-            logger.debug(f"Memory Stats - Process: {memory_mb}MB ({memory_percent:.1f}%), "  
-                        f"System: {system_memory.percent:.1f}% used, "  
-                        f"Stash: {stash_stats.get('memory_mb', 0):.1f}MB, "  
-                        f"Queue: {queue_size}/{queue_max}, "  
-                        f"Streaming: {streaming_info}")  
-                        
-        except Exception as e:  
-            logger.debug(f"Failed to log memory stats: {e}")  
-    
-    def _adjust_processing_strategy(self):  
-        """Dynamically adjust processing strategy based on memory usage"""  
-        try:  
-            memory_percent = psutil.Process().memory_percent()  
-            
-            # 根据内存使用情况调整队列大小  
-            if memory_percent > 80:  
-                # 高内存压力：减小队列  
-                new_maxsize = max(5, self.new_data_queue.maxsize // 2)  
-            elif memory_percent < 40:  
-                # 低内存压力：可以增大队列  
-                new_maxsize = min(50, self.new_data_queue.maxsize * 2)  
-            else:  
-                return  # 内存使用正常，不调整  
-            
-            # 注意：Python的Queue不支持动态调整maxsize，这里只是记录建议值  
-            logger.debug(f"Suggested queue size adjustment: {self.new_data_queue.maxsize} -> {new_maxsize}")  
-            
-            # 调整垃圾回收频率  
-            if memory_percent > 70:  
-                self.large_file_config.gc_frequency = max(5, self.large_file_config.gc_frequency - 2)  
-            elif memory_percent < 50:  
-                self.large_file_config.gc_frequency = min(20, self.large_file_config.gc_frequency + 2)  
-                
-        except Exception as e:  
-            logger.debug(f"Failed to adjust processing strategy: {e}")
-
-
-    def _enhanced_resume_check(self) -> int:  
-        """Enhanced resume check with integrity verification"""  
-        start_line = 4 if self.version >= 2 else 2  
-        
-        # 加载进度检查点  
-        checkpoint_line = self._load_progress_checkpoint()  
-        if checkpoint_line > start_line:  
-            # 验证检查点的完整性  
-            if self._verify_checkpoint_integrity(checkpoint_line):  
-                logger.info(f"Resuming from verified checkpoint at line {checkpoint_line}")  
-                return checkpoint_line  
-            else:  
-                logger.warning("Checkpoint integrity verification failed, performing full verification")  
-        
-        # 执行完整的哈希验证  
-        return self._comprehensive_hash_verification()  
-    
-    def _verify_checkpoint_integrity(self, checkpoint_line: int) -> bool:  
-        """Verify the integrity of a checkpoint by checking recent operations"""  
-        try:  
-            # 检查最近几个命令的完整性  
-            verification_range = max(0, checkpoint_line - 5)  
-            
-            for line_num in range(verification_range, checkpoint_line):  
-                if line_num >= len(self.transfer_lines):  
-                    continue  
-                    
-                line = self.transfer_lines[line_num].strip()  
-                if not line:  
-                    continue  
-                    
-                tokens = line.split()  
-                if not tokens:  
-                    continue  
-                    
-                cmd = tokens[0]  
-                
-                # 验证关键命令的完整性  
-                if cmd in ['bsdiff', 'imgdiff', 'new', 'move']:  
-                    if not self._verify_command_integrity(tokens, cmd):  
-                        logger.warning(f"Command integrity check failed at line {line_num}: {cmd}")  
-                        return False  
-            
-            return True  
-            
-        except Exception as e:  
-            logger.error(f"Checkpoint integrity verification failed: {e}")  
-            return False  
-    
-    def _verify_command_integrity(self, tokens: List[str], cmd_name: str) -> bool:  
-        """Verify the integrity of a specific command"""  
-        try:  
-            if self.version >= 3 and cmd_name in ['bsdiff', 'imgdiff']:  
-                if len(tokens) >= 6:  
-                    tgt_hash = tokens[4]  
-                    tgt_range = tokens[5]  
-                    
-                    tgt_rangeset = RangeSet(tgt_range)  
-                    actual_data = self._read_blocks(tgt_rangeset)  
-                    if actual_data:  
-                        actual_hash = hashlib.sha1(actual_data).hexdigest()  
-                        return actual_hash == tgt_hash  
-            elif cmd_name == 'new':  
-                if len(tokens) >= 2:  
-                    tgt_range = tokens[1]  
-                    tgt_rangeset = RangeSet(tgt_range)  
-                    actual_data = self._read_blocks(tgt_rangeset)  
-                    if actual_data:  
-                        # 检查块是否已被正确写入  
-                        return not all(b == 0 for b in actual_data)  
-            elif cmd_name == 'move':  
-                # 对于move命令，检查目标范围是否有数据  
-                if len(tokens) >= 2:  
-                    tgt_range = tokens[1] if self.version == 1 else tokens[3]  
-                    tgt_rangeset = RangeSet(tgt_range)  
-                    actual_data = self._read_blocks(tgt_rangeset)  
-                    return actual_data is not None  
-            
-            return True  
-            
-        except Exception as e:  
-            logger.debug(f"Command integrity check error: {e}")  
-            return False  
-    
-    def _comprehensive_hash_verification(self) -> int:  
-        """Comprehensive hash verification for reliable resume point detection"""  
-        start_line = 4 if self.version >= 2 else 2  
-        last_verified_line = start_line  
-        
-        logger.info("Performing comprehensive hash verification for resume point detection")  
-        
-        for line_num in range(start_line, len(self.transfer_lines)):  
-            line = self.transfer_lines[line_num].strip()  
-            if not line:  
-                continue  
-                
-            tokens = line.split()  
-            if not tokens:  
-                continue  
-                
-            cmd = tokens[0]  
-            
-            # 只检查会修改数据的命令  
-            if cmd in ['bsdiff', 'imgdiff', 'new', 'move']:  
-                if self._verify_command_integrity(tokens, cmd):  
-                    last_verified_line = line_num + 1  
-                else:  
-                    logger.info(f"Found incomplete operation at line {line_num}, resuming from line {last_verified_line}")  
-                    return last_verified_line  
-        
-        logger.info("All operations verified as complete")  
-        return len(self.transfer_lines)  # 所有操作都已完成
-
-    def _verify_data_integrity(self, data: bytes, expected_hash: str = None, operation: str = "unknown") -> bool:  
-        """Verify data integrity with optional hash checking"""  
-        try:  
-            # 基本数据检查  
-            if not data:  
-                logger.error(f"Data integrity check failed: empty data for {operation}")  
-                return False  
-            
-            # 检查数据是否全为零（可能表示损坏）  
-            if len(data) > self.BLOCKSIZE and all(b == 0 for b in data):  
-                logger.warning(f"Data integrity warning: all-zero data detected for {operation}")  
-            
-            # 哈希验证  
-            if expected_hash and expected_hash != "0" * 40:  
-                actual_hash = hashlib.sha1(data).hexdigest()  
-                if actual_hash != expected_hash:  
-                    logger.error(f"Data integrity check failed: hash mismatch for {operation}")  
-                    logger.error(f"Expected: {expected_hash}, Got: {actual_hash}")  
-                    return False  
-            
-            # 检查数据模式（检测可能的损坏模式）  
-            if self._detect_corruption_patterns(data):  
-                logger.warning(f"Potential data corruption patterns detected for {operation}")  
-                return False  
-            
-            return True  
-            
-        except Exception as e:  
-            logger.error(f"Data integrity verification failed for {operation}: {e}")  
-            return False  
-    
-    def _detect_corruption_patterns(self, data: bytes) -> bool:  
-        """Detect common data corruption patterns"""  
-        try:  
-            # 检查重复模式（可能表示损坏）  
-            if len(data) >= 1024:  
-                chunk_size = 256  
-                chunks = [data[i:i+chunk_size] for i in range(0, min(len(data), 1024), chunk_size)]  
-                
-                # 如果所有块都相同，可能是损坏  
-                if len(set(chunks)) == 1 and chunks[0] != b'\x00' * chunk_size:  
-                    logger.debug("Detected repeated pattern in data")  
-                    return True  
-            
-            # 检查异常的字节分布  
-            if len(data) >= 1024:  
-                byte_counts = {}  
-                sample_size = min(1024, len(data))  
-                for byte in data[:sample_size]:  
-                    byte_counts[byte] = byte_counts.get(byte, 0) + 1  
-                
-                # 如果某个字节值占比超过90%，可能是损坏  
-                max_count = max(byte_counts.values())  
-                if max_count > sample_size * 0.9:  
-                    logger.debug("Detected unusual byte distribution")  
-                    return True  
-            
-            return False  
-            
-        except Exception as e:  
-            logger.debug(f"Corruption pattern detection failed: {e}")  
-            return False  
-    
-    def _repair_corrupted_data(self, rangeset: RangeSet, expected_hash: str = None) -> Optional[bytes]:  
-        """Attempt to repair corrupted data using various strategies"""  
-        logger.info(f"Attempting to repair corrupted data for {rangeset.size} blocks")  
-        
-        # 策略1：从stash缓存恢复  
-        if expected_hash:  
-            cached_data = self.stash_cache.get(expected_hash)  
-            if cached_data and self._verify_data_integrity(cached_data, expected_hash, "cache_recovery"):  
-                logger.info("Successfully recovered data from stash cache")  
-                return cached_data  
-        
-        # 策略2：重新读取数据（可能是临时I/O错误）  
-        try:  
-            logger.info("Attempting to re-read data")  
-            recovered_data = self._read_blocks_with_retry(rangeset, max_retries=3)  
-            if recovered_data and self._verify_data_integrity(recovered_data, expected_hash, "re_read"):  
-                logger.info("Successfully recovered data by re-reading")  
-                return recovered_data  
-        except Exception as e:  
-            logger.warning(f"Re-read attempt failed: {e}")  
-        
-        # 策略3：从备份位置恢复（如果有的话）  
-        backup_data = self._try_backup_recovery(rangeset, expected_hash)  
-        if backup_data:  
-            return backup_data  
-        
-        logger.error("All data recovery strategies failed")  
-        return None  
-    
-    def _read_blocks_with_retry(self, rangeset: RangeSet, max_retries: int = 3) -> Optional[bytes]:  
-        """Read blocks with retry logic for handling transient errors"""  
-        for attempt in range(max_retries):  
-            try:  
-                # 在每次重试之间稍作等待  
-                if attempt > 0:  
-                    time.sleep(0.1 * attempt)  
-                
-                data = self._read_blocks_sync(rangeset)  
-                if data:  
-                    return data  
-                    
-            except Exception as e:  
-                logger.warning(f"Read attempt {attempt + 1} failed: {e}")  
-                if attempt == max_retries - 1:  
-                    raise  
-        
-        return None  
-    
-    def _try_backup_recovery(self, rangeset: RangeSet, expected_hash: str = None) -> Optional[bytes]:  
-        """Try to recover data from backup locations"""  
-        try:  
-            # 检查是否有备份文件  
-            backup_file = self.stash_base_dir / f"backup_{expected_hash}" if expected_hash else None  
-            if backup_file and backup_file.exists():  
-                backup_data = backup_file.read_bytes()  
-                if self._verify_data_integrity(backup_data, expected_hash, "backup_recovery"):  
-                    logger.info("Successfully recovered data from backup file")  
-                    return backup_data  
-            
-            return None  
-            
-        except Exception as e:  
-            logger.warning(f"Backup recovery failed: {e}")  
-            return None
-
-    def _initialize_performance_monitoring(self):  
-        """Initialize comprehensive performance monitoring and diagnostics"""  
-        self.performance_stats = {  
-            'session': {  
-                'start_time': time.time(),  
-                'session_id': hashlib.md5(str(time.time()).encode()).hexdigest()[:8],  
-                'total_runtime': 0,  
-                'completion_percentage': 0  
-            },  
-            'commands': {  
-                'executed': 0,  
-                'failed': 0,  
-                'skipped': 0,  
-                'timings': {},  
-                'error_details': {}  
-            },  
-            'data_processing': {  
-                'blocks_read': 0,  
-                'blocks_written': 0,  
-                'bytes_transferred': 0,  
-                'compression_ratio': 0,  
-                'patch_efficiency': {}  
-            },  
-            'memory': {  
-                'peak_usage_mb': 0,  
-                'current_usage_mb': 0,  
-                'gc_collections': 0,  
-                'cache_efficiency': {  
-                    'hits': 0,  
-                    'misses': 0,  
-                    'evictions': 0  
-                }  
-            },  
-            'io_performance': {  
-                'read_operations': 0,  
-                'write_operations': 0,  
-                'read_throughput_mbps': 0,  
-                'write_throughput_mbps': 0,  
-                'seek_operations': 0,  
-                'sync_operations': 0  
-            },  
-            'threading': {  
-                'producer_restarts': 0,  
-                'queue_overflows': 0,  
-                'lock_contentions': 0,  
-                'thread_efficiency': 0  
-            },  
-            'errors_and_recovery': {  
-                'recoverable_errors': 0,  
-                'fatal_errors': 0,  
-                'recovery_attempts': 0,  
-                'recovery_success_rate': 0  
-            }  
-        }  
-        
-        # 初始化性能监控定时器  
-        self._last_stats_update = time.time()  
-        self._stats_update_interval = 5.0  # 每5秒更新一次统计  
-    
-    def _update_performance_stats(self, category: str, operation: str, **kwargs):  
-        """Update performance statistics with detailed categorization"""  
-        try:  
-            current_time = time.time()  
-            
-            if category == 'command':  
-                self._update_command_stats(operation, current_time, **kwargs)  
-            elif category == 'data':  
-                self._update_data_stats(operation, **kwargs)  
-            elif category == 'memory':  
-                self._update_memory_stats(operation, **kwargs)  
-            elif category == 'io':  
-                self._update_io_stats(operation, current_time, **kwargs)  
-            elif category == 'threading':  
-                self._update_threading_stats(operation, **kwargs)  
-            elif category == 'error':  
-                self._update_error_stats(operation, **kwargs)  
-            
-            # 定期计算综合指标  
-            if current_time - self._last_stats_update > self._stats_update_interval:  
-                self._calculate_derived_metrics()  
-                self._last_stats_update = current_time  
-                
-        except Exception as e:  
-            logger.debug(f"Performance stats update failed: {e}")  
-    
-    def _update_command_stats(self, operation: str, current_time: float, **kwargs):  
-        """Update command-specific statistics"""  
-        stats = self.performance_stats['commands']  
-        
-        if operation == 'start':  
-            cmd = kwargs.get('command')  
-            if cmd not in stats['timings']:  
-                stats['timings'][cmd] = {  
-                    'count': 0,  
-                    'total_time': 0,  
-                    'avg_time': 0,  
-                    'min_time': float('inf'),  
-                    'max_time': 0,  
-                    'current_start': current_time  
-                }  
-            else:  
-                stats['timings'][cmd]['current_start'] = current_time  
-            stats['executed'] += 1  
-            
-        elif operation == 'end':  
-            cmd = kwargs.get('command')  
-            success = kwargs.get('success', True)  
-            
-            if cmd in stats['timings'] and 'current_start' in stats['timings'][cmd]:  
-                duration = current_time - stats['timings'][cmd]['current_start']  
-                cmd_stats = stats['timings'][cmd]  
-                
-                cmd_stats['count'] += 1  
-                cmd_stats['total_time'] += duration  
-                cmd_stats['avg_time'] = cmd_stats['total_time'] / cmd_stats['count']  
-                cmd_stats['min_time'] = min(cmd_stats['min_time'], duration)  
-                cmd_stats['max_time'] = max(cmd_stats['max_time'], duration)  
-                
-                if not success:  
-                    stats['failed'] += 1  
-                    if cmd not in stats['error_details']:  
-                        stats['error_details'][cmd] = 0  
-                    stats['error_details'][cmd] += 1  
-    
-    def _update_data_stats(self, operation: str, **kwargs):  
-        """Update data processing statistics"""  
-        stats = self.performance_stats['data_processing']  
-        
-        if operation == 'blocks_read':  
-            blocks = kwargs.get('blocks', 0)  
-            stats['blocks_read'] += blocks  
-            
-        elif operation == 'blocks_written':  
-            blocks = kwargs.get('blocks', 0)  
-            stats['blocks_written'] += blocks  
-            
-        elif operation == 'bytes_transferred':  
-            bytes_count = kwargs.get('bytes', 0)  
-            stats['bytes_transferred'] += bytes_count  
-            
-        elif operation == 'patch_applied':  
-            patch_type = kwargs.get('patch_type', 'unknown')  
-            src_size = kwargs.get('src_size', 0)  
-            patch_size = kwargs.get('patch_size', 0)  
-            
-            if patch_type not in stats['patch_efficiency']:  
-                stats['patch_efficiency'][patch_type] = {  
-                    'count': 0,  
-                    'total_src_size': 0,  
-                    'total_patch_size': 0,  
-                    'avg_compression': 0  
-                }  
-            
-            patch_stats = stats['patch_efficiency'][patch_type]  
-            patch_stats['count'] += 1  
-            patch_stats['total_src_size'] += src_size  
-            patch_stats['total_patch_size'] += patch_size  
-            
-            if patch_stats['total_src_size'] > 0:  
-                patch_stats['avg_compression'] = patch_stats['total_patch_size'] / patch_stats['total_src_size']  
-    
-    def _update_memory_stats(self, operation: str, **kwargs):  
-        """Update memory usage statistics"""  
-        stats = self.performance_stats['memory']  
-        
-        if operation == 'usage_update':  
-            memory_mb = kwargs.get('memory_mb', 0)  
-            stats['current_usage_mb'] = memory_mb  
-            stats['peak_usage_mb'] = max(stats['peak_usage_mb'], memory_mb)  
-            
-        elif operation == 'gc_collection':  
-            stats['gc_collections'] += 1  
-            
-        elif operation == 'cache_hit':  
-            stats['cache_efficiency']['hits'] += 1  
-            
-        elif operation == 'cache_miss':  
-            stats['cache_efficiency']['misses'] += 1  
-            
-        elif operation == 'cache_eviction':  
-            stats['cache_efficiency']['evictions'] += 1  
-    
-    def _update_io_stats(self, operation: str, current_time: float, **kwargs):  
-        """Update I/O performance statistics"""  
-        stats = self.performance_stats['io_performance']  
-        
-        if operation == 'read':  
-            stats['read_operations'] += 1  
-            bytes_read = kwargs.get('bytes', 0)  
-            duration = kwargs.get('duration', 0)  
-            
-            if duration > 0:  
-                throughput_mbps = (bytes_read / (1024 * 1024)) / duration  
-                # 使用移动平均计算吞吐量  
-                if stats['read_throughput_mbps'] == 0:  
-                    stats['read_throughput_mbps'] = throughput_mbps  
-                else:  
-                    stats['read_throughput_mbps'] = (stats['read_throughput_mbps'] * 0.8 + throughput_mbps * 0.2)  
-                    
-        elif operation == 'write':  
-            stats['write_operations'] += 1  
-            bytes_written = kwargs.get('bytes', 0)  
-            duration = kwargs.get('duration', 0)  
-            
-            if duration > 0:  
-                throughput_mbps = (bytes_written / (1024 * 1024)) / duration  
-                if stats['write_throughput_mbps'] == 0:  
-                    stats['write_throughput_mbps'] = throughput_mbps  
-                else:  
-                    stats['write_throughput_mbps'] = (stats['write_throughput_mbps'] * 0.8 + throughput_mbps * 0.2)  
-                    
-        elif operation == 'seek':  
-            stats['seek_operations'] += 1  
-            
-        elif operation == 'sync':  
-            stats['sync_operations'] += 1  
-    
-    def _update_threading_stats(self, operation: str, **kwargs):  
-        """Update threading performance statistics"""  
-        stats = self.performance_stats['threading']  
-        
-        if operation == 'producer_restart':  
-            stats['producer_restarts'] += 1  
-            
-        elif operation == 'queue_overflow':  
-            stats['queue_overflows'] += 1  
-            
-        elif operation == 'lock_contention':  
-            stats['lock_contentions'] += 1  
-            
-        elif operation == 'efficiency_update':  
-            efficiency = kwargs.get('efficiency', 0)  
-            stats['thread_efficiency'] = efficiency  
-    
-    def _update_error_stats(self, operation: str, **kwargs):  
-        """Update error and recovery statistics"""  
-        stats = self.performance_stats['errors_and_recovery']  
-        
-        if operation == 'recoverable_error':  
-            stats['recoverable_errors'] += 1  
-            
-        elif operation == 'fatal_error':  
-            stats['fatal_errors'] += 1  
-            
-        elif operation == 'recovery_attempt':  
-            stats['recovery_attempts'] += 1  
-            
-        elif operation == 'recovery_success':  
-            if stats['recovery_attempts'] > 0:  
-                success_count = kwargs.get('success_count', 1)  
-                stats['recovery_success_rate'] = success_count / stats['recovery_attempts']  
-    
-    def _calculate_derived_metrics(self):  
-        """Calculate derived performance metrics"""  
-        try:  
-            current_time = time.time()  
-            session_stats = self.performance_stats['session']  
-            
-            # 更新会话统计  
-            session_stats['total_runtime'] = current_time - session_stats['start_time']  
-            
-            # 计算完成百分比  
-            if self.total_blocks > 0:  
-                session_stats['completion_percentage'] = (self.written / self.total_blocks) * 100  
-            
-            # 计算缓存效率  
-            cache_stats = self.performance_stats['memory']['cache_efficiency']  
-            total_cache_ops = cache_stats['hits'] + cache_stats['misses']  
-            if total_cache_ops > 0:  
-                cache_stats['hit_rate'] = cache_stats['hits'] / total_cache_ops  
-            
-            # 计算线程效率  
-            threading_stats = self.performance_stats['threading']  
-            if threading_stats['producer_restarts'] > 0:  
-                restart_rate = threading_stats['producer_restarts'] / session_stats['total_runtime']  
-                threading_stats['thread_efficiency'] = max(0, 1 - restart_rate)  
-            
-        except Exception as e:  
-            logger.debug(f"Derived metrics calculation failed: {e}")  
-    
-    def _generate_performance_report(self) -> dict:  
-        """Generate comprehensive performance report with insights"""  
-        try:  
-            self._calculate_derived_metrics()  
-            
-            report = {  
-                'summary': self._generate_summary_metrics(),  
-                'detailed_stats': self.performance_stats.copy(),  
-                'performance_insights': self._generate_performance_insights(),  
-                'recommendations': self._generate_recommendations(),  
-                'timestamp': time.time()  
-            }  
-            
-            return report  
-            
-        except Exception as e:  
-            logger.error(f"Performance report generation failed: {e}")  
-            return {'error': str(e)}  
-    
-    def _generate_summary_metrics(self) -> dict:  
-        """Generate high-level summary metrics"""  
-        session = self.performance_stats['session']  
-        commands = self.performance_stats['commands']  
-        data = self.performance_stats['data_processing']  
-        memory = self.performance_stats['memory']  
-        io = self.performance_stats['io_performance']  
-        
-        return {  
-            'runtime_minutes': session['total_runtime'] / 60,  
-            'completion_percentage': session['completion_percentage'],  
-            'commands_per_minute': commands['executed'] / max(session['total_runtime'] / 60, 1),  
-            'error_rate': commands['failed'] / max(commands['executed'], 1),  
-            'data_throughput_mbps': data['bytes_transferred'] / (1024 * 1024) / max(session['total_runtime'], 1),  
-            'memory_efficiency': memory['peak_usage_mb'] / max(memory['current_usage_mb'], 1),  
-            'io_efficiency': (io['read_throughput_mbps'] + io['write_throughput_mbps']) / 2,  
-            'cache_hit_rate': memory['cache_efficiency'].get('hit_rate', 0)  
-        }  
-    
-    def _generate_performance_insights(self) -> List[str]:  
-        """Generate performance insights and observations"""  
-        insights = []  
-        summary = self._generate_summary_metrics()  
-        
-        # 性能洞察  
-        if summary['error_rate'] > 0.1:  
-            insights.append(f"High error rate detected: {summary['error_rate']:.1%}")  
-        
-        if summary['cache_hit_rate'] < 0.8:  
-            insights.append(f"Low cache efficiency: {summary['cache_hit_rate']:.1%} hit rate")  
-        
-        if summary['memory_efficiency'] > 2.0:  
-            insights.append("Memory usage is highly variable, consider optimization")  
-        
-        if summary['io_efficiency'] < 10:  
-            insights.append(f"Low I/O throughput: {summary['io_efficiency']:.1f} MB/s average")  
-        
-        # 线程性能洞察  
-        threading_stats = self.performance_stats['threading']  
-        if threading_stats['producer_restarts'] > 5:  
-            insights.append(f"Frequent producer thread restarts: {threading_stats['producer_restarts']}")  
-        
-        return insights  
-
-    def _generate_recommendations(self) -> List[str]:  
-        """Generate performance optimization recommendations"""  
-        recommendations = []  
-        summary = self._generate_summary_metrics()  
-        
-        if summary['cache_hit_rate'] < 0.7:  
-            recommendations.append("Consider increasing cache size or adjusting eviction policy")  
-        
-        if summary['error_rate'] > 0.05:  
-            recommendations.append("Review error handling and add more robust retry mechanisms")  
-        
-        if summary['io_efficiency'] < 20:  
-            recommendations.append("Consider using larger I/O buffer sizes or async I/O")  
-        
-        if self.performance_stats['memory']['peak_usage_mb'] > 1024:  
-            recommendations.append("Consider implementing more aggressive memory management")  
-        
-        return recommendations  
-
-    def __exit__(self, exc_type, exc_val, exc_tb):  
-        """Enhanced cleanup with proper resource management and cache cleanup - fixed resource leaks"""  
-        logger.info("Cleaning up BlockImageUpdate resources")  
-          
-        # 修复：更安全的线程停止  
-        if self.new_data_producer_thread and self.new_data_producer_thread.is_alive():  
-            self.new_data_producer_running.clear()  
-              
-            # 通知所有等待的线程  
-            with self.new_data_condition:  
-                self.new_data_condition.notify_all()  
-              
-            # 等待线程结束，如果超时则强制终止  
-            self.new_data_producer_thread.join(timeout=5)  
-            if self.new_data_producer_thread.is_alive():  
-                logger.warning("Producer thread did not terminate gracefully")  
-          
-        # 修复：确保所有文件描述符都被正确关闭  
-        resources_to_close = [  
-            ('patch_data_mmap', self.patch_data_mmap),  
-            ('new_data_fd', self.new_data_fd),  
-            ('patch_data_fd', self.patch_data_fd)  
-        ]  
-          
-        for resource_name, resource in resources_to_close:  
-            if resource:  
-                try:  
-                    if hasattr(resource, 'close'):  
-                        resource.close()  
-                    setattr(self, resource_name, None)  
-                    logger.debug(f"Successfully closed {resource_name}")  
-                except Exception as e:  
-                    logger.warning(f"Failed to close {resource_name}: {e}")  
-          
-        # Clean up progress checkpoint on normal completion  
-        if exc_type is None:  
-            self._cleanup_progress_checkpoint()  
-          
-        # Cleanup stash (now includes LRU cache cleanup)  
-        self._cleanup_stash()  
-          
-        # 修复：更安全的队列清理  
-        try:  
-            # 首先停止所有生产者  
-            self.new_data_producer_running.clear()  
-              
-            # 清空队列但记录丢弃的数据量  
-            discarded_items = 0  
-            while not self.new_data_queue.empty():  
-                try:  
-                    item = self.new_data_queue.get_nowait()  
-                    if item is not None:  # 不计算EOF信号  
-                        discarded_items += 1  
-                    self.new_data_queue.task_done()  
-                except queue.Empty:  
-                    break  
-              
-            if discarded_items > 0:  
-                logger.warning(f"Discarded {discarded_items} unprocessed queue items during cleanup")  
-                  
-        except Exception as e:  
-            logger.warning(f"Failed to clear queue: {e}")  
-
-    def _log_performance_summary(self):  
-        """Log a concise performance summary with key metrics"""  
-        try:  
-            summary = self._generate_summary_metrics()  
-            session = self.performance_stats['session']  
-            
-            # 基本会话信息  
-            logger.info(f"=== Performance Summary (Session: {session['session_id']}) ===")  
-            logger.info(f"Runtime: {summary['runtime_minutes']:.1f} minutes")  
-            logger.info(f"Progress: {summary['completion_percentage']:.1f}% complete")  
-            
-            # 命令执行统计  
-            commands = self.performance_stats['commands']  
-            logger.info(f"Commands: {commands['executed']} executed, {commands['failed']} failed")  
-            logger.info(f"Command rate: {summary['commands_per_minute']:.1f} commands/min")  
-            
-            # 数据处理统计  
-            data = self.performance_stats['data_processing']  
-            logger.info(f"Data: {data['blocks_written']} blocks written, {summary['data_throughput_mbps']:.1f} MB/s")  
-            
-            # 内存和缓存统计  
-            memory = self.performance_stats['memory']  
-            logger.info(f"Memory: {memory['current_usage_mb']:.0f}MB current, {memory['peak_usage_mb']:.0f}MB peak")  
-            logger.info(f"Cache: {summary['cache_hit_rate']:.1%} hit rate, {memory['cache_efficiency']['evictions']} evictions")  
-            
-            # I/O性能统计  
-            io = self.performance_stats['io_performance']  
-            logger.info(f"I/O: {io['read_operations']} reads, {io['write_operations']} writes")  
-            logger.info(f"Throughput: R={summary.get('read_throughput_mbps', 0):.1f} W={summary.get('write_throughput_mbps', 0):.1f} MB/s")  
-            
-            # 线程和错误统计  
-            threading = self.performance_stats['threading']  
-            errors = self.performance_stats['errors_and_recovery']  
-            if threading['producer_restarts'] > 0 or errors['recoverable_errors'] > 0:  
-                logger.info(f"Issues: {threading['producer_restarts']} thread restarts, {errors['recoverable_errors']} recoverable errors")  
-            
-            # 性能洞察  
-            insights = self._generate_performance_insights()  
-            if insights:  
-                logger.info("Performance insights:")  
-                for insight in insights[:3]:  # 只显示前3个最重要的洞察  
-                    logger.info(f"  • {insight}")  
-            
-            logger.info("=" * 50)  
-            
-        except Exception as e:  
-            logger.warning(f"Failed to log performance summary: {e}")  
-    
-    def _save_performance_report(self, filename: str = None):  
-        """Save detailed performance report to file"""  
-        try:  
-            if not filename:  
-                timestamp = time.strftime("%Y%m%d_%H%M%S")  
-                filename = f"performance_report_{timestamp}.json"  
-            
-            report = self._generate_performance_report()  
-            
-            report_file = self.stash_base_dir / filename  
-            with open(report_file, 'w', encoding='utf-8') as f:  
-                json.dump(report, f, indent=2, ensure_ascii=False)  
-            
-            logger.info(f"Performance report saved to: {report_file}")  
-            return str(report_file)  
-            
-        except Exception as e:  
-            logger.error(f"Failed to save performance report: {e}")  
-            return None  
-    
-    def _export_performance_metrics(self) -> dict:  
-        """Export performance metrics for external monitoring systems"""  
-        try:  
-            summary = self._generate_summary_metrics()  
-            
-            # 导出关键指标，格式适合监控系统  
-            metrics = {  
-                'biu_runtime_seconds': self.performance_stats['session']['total_runtime'],  
-                'biu_completion_percentage': summary['completion_percentage'],  
-                'biu_commands_executed_total': self.performance_stats['commands']['executed'],  
-                'biu_commands_failed_total': self.performance_stats['commands']['failed'],  
-                'biu_error_rate': summary['error_rate'],  
-                'biu_blocks_written_total': self.performance_stats['data_processing']['blocks_written'],  
-                'biu_bytes_transferred_total': self.performance_stats['data_processing']['bytes_transferred'],  
-                'biu_memory_usage_mb': self.performance_stats['memory']['current_usage_mb'],  
-                'biu_memory_peak_mb': self.performance_stats['memory']['peak_usage_mb'],  
-                'biu_cache_hit_rate': summary['cache_hit_rate'],  
-                'biu_io_read_ops_total': self.performance_stats['io_performance']['read_operations'],  
-                'biu_io_write_ops_total': self.performance_stats['io_performance']['write_operations'],  
-                'biu_thread_restarts_total': self.performance_stats['threading']['producer_restarts'],  
-                'biu_recoverable_errors_total': self.performance_stats['errors_and_recovery']['recoverable_errors']  
-            }  
-            
-            return metrics  
-            
-        except Exception as e:  
-            logger.error(f"Failed to export performance metrics: {e}")  
-            return {}
-
-
+  
   
 def main():  
     """Main entry point"""  
