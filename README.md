@@ -1,4 +1,5 @@
 # The AI-Generated [imgpatchtools](https://github.com/erfanoabdi/imgpatchtools)
+Patch img files with <Partition>.patch.dat But just needed Python3
 
 ## Original Information
 - [Original Repository](https://github.com/erfanoabdi/imgpatchtools)
@@ -20,6 +21,29 @@ CPython 3.13(With Only Bsdiff4 Module)
 x imgdiff
 - transfer.list(V4):erase/bsdiff/move/new/stash/free/zero
 - ApplyPatch.py(For patching boot with boot.img.p)
+
+## Usage
+### the BIU(BlockImageUpdate)
+`python3 BlockImageUpdate.py <system.img> <system.transfer.list> <system.new.dat> <system.patch.dat> [--continue-on-error]`
+args:
+        - block device (or file) to modify in-place
+        - transfer list (blob)
+        - new data stream (filename within package.zip)
+        - patch stream (filename within package.zip, must be uncompressed)
+        --continue-on-error: continue execution even if commands fail
+
+
+### the AP(ApplyPatch)
+`python3 ApplyPatch.py <file> <target> <tgt_sha1> <size> <init_sha1(1)> <patch(1)> [init_sha1(2)] [patch(2)] ... [bonus]`
+        <file> = source file from rom zip
+        <target> = target file (use "-" to patch source file)
+        <tgt_sha1> = target SHA1 Sum after patching
+        <size> = file size
+        <init_sha1> = file SHA1 sum
+        <patch> = patch file (.p) from OTA zip
+        <bonus> = bonus resource file
+
+
 
 ## How I wrote this
 I goto the [deepwiki page of imgpatchtools repository](https://deepwiki.com/erfanoabdi/imgpatchtools) and ask the ai to write a python3 implemention of the ApplyPatch and BlockImageUpdate.

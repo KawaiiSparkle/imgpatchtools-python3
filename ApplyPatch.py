@@ -9,7 +9,7 @@ import shutil
 import zlib  
 from typing import List, Optional, Tuple, Union  
 import subprocess  
-import bsdiff4  
+import bsdiff4   # type: ignore
 import asyncio  
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor  
 import mmap  
@@ -253,187 +253,262 @@ def process_normal_chunk(chunk_idx: int, source_data: bytes, patch_data: bytes, 
     result = apply_bsdiff_patch(chunk_source, chunk_patch)  
     return result, pos + 24  
   
-def process_raw_chunk(chunk_idx: int, patch_data: bytes, pos: int) -> Tuple[bytes, int]:  
-    """Process CHUNK_RAW with correct length reading"""  
-    if pos + 4 > len(patch_data):  
-        raise ValueError(f"Failed to read chunk {chunk_idx} raw header")  
-      
-    data_len = read_le_int32(patch_data, pos)  # 使用 32 位读取  
-    pos += 4  
-      
-    if pos + data_len > len(patch_data):  
-        raise ValueError(f"Raw chunk data out of range")  
-      
+def process_raw_chunk(chunk_idx: int, patch_data: bytes, pos: int) -> Tuple[bytes, int]:      
+    """Process CHUNK_RAW with correct length reading and validation"""      
+    if pos + 8 > len(patch_data):    # 改为8字节以匹配64位读取  
+        raise ValueError(f"Failed to read chunk {chunk_idx} raw header")      
+          
+    data_len = read_le_int64(patch_data, pos)  # 统一使用64位读取      
+    pos += 8      
+        
+    # 添加数值验证    
+    if data_len < 0:    
+        raise ValueError(f"Invalid RAW chunk data length: {data_len} (negative)")    
+    if data_len > len(patch_data) - pos:    
+        raise ValueError(f"Invalid RAW chunk data length: {data_len} (exceeds remaining data)")    
+    if data_len > 100 * 1024 * 1024:  # 100MB 限制    
+        raise ValueError(f"RAW chunk data too large: {data_len} bytes")    
+          
     return patch_data[pos:pos + data_len], pos + data_len
 
 
 
+
   
-def process_compressed_chunk(chunk_idx: int, chunk_type: int, source_data: bytes,   
-                           patch_data: bytes, pos: int, bonus_data: bytes = None) -> Tuple[bytes, int]:  
-    """Process CHUNK_GZIP or CHUNK_DEFLATE with basic compression handling"""  
-      
-    header_size = 60 if chunk_type == CHUNK_DEFLATE else 32  
-      
-    if pos + header_size > len(patch_data):  
-        raise ValueError(f"Failed to read chunk {chunk_idx} compressed header")  
-      
-    src_start = read_le_int32(patch_data, pos)  
-    src_len = read_le_int32(patch_data, pos + 8)  
-    patch_offset = read_le_int32(patch_data, pos + 16)  
-    expanded_len = read_le_int32(patch_data, pos + 24)  
-      
-    # 对于 CHUNK_DEFLATE，读取压缩参数但使用安全默认值  
+def process_compressed_chunk(chunk_idx: int, chunk_type: int, source_data: bytes,     
+                           patch_data: bytes, pos: int, bonus_data: bytes = None) -> Tuple[bytes, int]:    
+    """Process CHUNK_GZIP or CHUNK_DEFLATE with correct header size calculation"""    
+        
+    # 基础头部大小都是32字节  
+    base_header_size = 32  
+        
+    if pos + base_header_size > len(patch_data):    
+        raise ValueError(f"Failed to read chunk {chunk_idx} compressed header")    
+        
+    src_start = read_le_int32(patch_data, pos)    
+    src_len = read_le_int32(patch_data, pos + 8)    
+    patch_offset = read_le_int32(patch_data, pos + 16)    
+    expanded_len = read_le_int32(patch_data, pos + 24)    
+        
+    # 对于 CHUNK_DEFLATE，读取额外的压缩参数  
     compression_level = 6  
+    window_bits = -15  
+    mem_level = 8  
+    strategy = 0  
+      
+    actual_header_size = base_header_size  
+      
     if chunk_type == CHUNK_DEFLATE:  
-        level = read_le_int32(patch_data, pos + 32)  
-        if 0 <= level <= 9:  
-            compression_level = level  
-      
-    if src_start + src_len > len(source_data):  
-        raise ValueError(f"Source parameters out of range: start={src_start}, len={src_len}")  
-      
-    compressed_source = source_data[src_start:src_start + src_len]  
-      
-    # 解压缩源数据  
-    try:  
-        if chunk_type == CHUNK_GZIP:  
-            uncompressed_source = zlib.decompress(compressed_source, 16 + zlib.MAX_WBITS)  
-        else:  # CHUNK_DEFLATE  
-            try:  
-                uncompressed_source = zlib.decompress(compressed_source)  
-            except zlib.error:  
-                uncompressed_source = zlib.decompress(compressed_source, -zlib.MAX_WBITS)  
-    except zlib.error as e:  
-        raise ValueError(f"Failed to decompress chunk {chunk_idx}: {e}")  
-      
-    # 处理 bonus data  
-    if bonus_data and chunk_idx == 1 and expanded_len > len(uncompressed_source):  
-        bonus_size = expanded_len - len(uncompressed_source)  
-        if bonus_size <= len(bonus_data):  
-            uncompressed_source += bonus_data[:bonus_size]  
-      
-    # 应用 bsdiff 补丁  
-    chunk_patch = patch_data[patch_offset:]  
-    patched_uncompressed = apply_bsdiff_patch(uncompressed_source, chunk_patch)  
-      
-    # 重新压缩  
-    try:  
-        if chunk_type == CHUNK_GZIP:  
-            result = zlib.compress(patched_uncompressed, level=compression_level, wbits=16 + zlib.MAX_WBITS)  
-        else:  # CHUNK_DEFLATE  
-            result = zlib.compress(patched_uncompressed, level=compression_level)  
-    except zlib.error as e:  
-        raise ValueError(f"Failed to recompress chunk {chunk_idx}: {e}")  
-      
-    return result, pos + header_size
-
+        # 检查是否有足够的数据读取额外参数  
+        if pos + 48 <= len(patch_data):  # 32 + 16 = 48字节  
+            level = read_le_int32(patch_data, pos + 32)  
+            window_bits_raw = read_le_int32(patch_data, pos + 36)  
+            mem_level_raw = read_le_int32(patch_data, pos + 40)  
+            strategy_raw = read_le_int32(patch_data, pos + 44)  
+              
+            # 验证参数范围  
+            if 0 <= level <= 9:  
+                compression_level = level  
+            if -15 <= window_bits_raw <= 15:  
+                window_bits = window_bits_raw  
+            if 1 <= mem_level_raw <= 9:  
+                mem_level = mem_level_raw  
+            if 0 <= strategy_raw <= 4:  
+                strategy = strategy_raw  
+                  
+            actual_header_size = 48  
+        else:  
+            # 如果没有足够数据，使用默认值  
+            BlockImageUpdate.logger.warning(f"DEFLATE chunk {chunk_idx} missing compression parameters, using defaults")  
+        
+    if src_start + src_len > len(source_data):    
+        raise ValueError(f"Source parameters out of range: start={src_start}, len={src_len}")    
+        
+    compressed_source = source_data[src_start:src_start + src_len]    
+        
+    # 解压缩源数据    
+    try:    
+        if chunk_type == CHUNK_GZIP:    
+            uncompressed_source = zlib.decompress(compressed_source, 16 + zlib.MAX_WBITS)    
+        else:  # CHUNK_DEFLATE    
+            try:    
+                uncompressed_source = zlib.decompress(compressed_source, window_bits)    
+            except zlib.error:    
+                uncompressed_source = zlib.decompress(compressed_source, -zlib.MAX_WBITS)    
+    except zlib.error as e:    
+        raise ValueError(f"Failed to decompress chunk {chunk_idx}: {e}")    
+        
+    # 处理 bonus data - 改进逻辑，不限制chunk_idx  
+    if bonus_data and expanded_len > len(uncompressed_source):    
+        bonus_size = expanded_len - len(uncompressed_source)    
+        if bonus_size <= len(bonus_data):    
+            uncompressed_source += bonus_data[:bonus_size]    
+            BlockImageUpdate.logger.debug(f"Applied {bonus_size} bytes of bonus data to chunk {chunk_idx}")  
+        
+    # 应用 bsdiff 补丁    
+    chunk_patch = patch_data[patch_offset:]    
+    patched_uncompressed = apply_bsdiff_patch(uncompressed_source, chunk_patch)    
+        
+    # 重新压缩    
+    try:    
+        if chunk_type == CHUNK_GZIP:    
+            result = zlib.compress(patched_uncompressed, level=compression_level, wbits=16 + zlib.MAX_WBITS)    
+        else:  # CHUNK_DEFLATE    
+            # 使用读取的压缩参数  
+            compressor = zlib.compressobj(level=compression_level, wbits=window_bits,   
+                                        memLevel=mem_level, strategy=strategy)  
+            result = compressor.compress(patched_uncompressed) + compressor.flush()  
+    except zlib.error as e:    
+        raise ValueError(f"Failed to recompress chunk {chunk_idx}: {e}")    
+        
+    return result, pos + actual_header_size
 
   
-def update_pos_for_chunk_type(chunk_type: int, patch_data: bytes, pos: int) -> int:  
-    """Update position based on chunk type with better validation"""  
-    if chunk_type == CHUNK_NORMAL:  
-        new_pos = pos + 24  
-    elif chunk_type in (CHUNK_GZIP, CHUNK_DEFLATE):  
+def update_pos_for_chunk_type(chunk_type: int, patch_data: bytes, pos: int) -> int:    
+    """Update position based on chunk type with better validation"""    
+    if chunk_type == CHUNK_NORMAL:    
+        new_pos = pos + 24    
+    elif chunk_type == CHUNK_GZIP:  
         new_pos = pos + 32  
-    elif chunk_type == CHUNK_RAW:  
-        if pos + 8 > len(patch_data):  
-            raise ValueError("Cannot read RAW chunk length")  
-        data_len = read_le_int64(patch_data, pos)  
-        if data_len < 0 or data_len > len(patch_data):  
-            raise ValueError(f"Invalid RAW chunk data length: {data_len}")  
-        new_pos = pos + 8 + data_len  
-    else:  
-        raise ValueError(f"Unknown chunk type: {chunk_type}")  
-      
-    # Validate new position  
-    if new_pos > len(patch_data):  
-        raise ValueError(f"Position {new_pos} exceeds patch data length {len(patch_data)}")  
-      
+    elif chunk_type == CHUNK_DEFLATE:  
+        # 检查是否有扩展头部  
+        if pos + 48 <= len(patch_data):  
+            new_pos = pos + 48  # 包含压缩参数  
+        else:  
+            new_pos = pos + 32  # 只有基础头部  
+    elif chunk_type == CHUNK_RAW:    
+        if pos + 8 > len(patch_data):    
+            raise ValueError("Cannot read RAW chunk length")    
+        data_len = read_le_int64(patch_data, pos)  # 统一使用64位  
+        if data_len < 0 or data_len > len(patch_data):    
+            raise ValueError(f"Invalid RAW chunk data length: {data_len}")    
+        new_pos = pos + 8 + data_len    
+    else:    
+        raise ValueError(f"Unknown chunk type: {chunk_type}")    
+        
+    # Validate new position    
+    if new_pos > len(patch_data):    
+        raise ValueError(f"Position {new_pos} exceeds patch data length {len(patch_data)}")    
+        
     return new_pos
+
                  
-async def generate_target_async(source_file: FileContents, patch_data: bytes,  
-                               target_filename: str, target_sha1: bytes,  
-                               target_size: int, bonus_data: bytes = None) -> bool:  
-    """Async version of target generation with retry logic"""  
-      
-    # 检查是否为分区目标，转换为文件写入  
-    if target_filename.startswith(('MTD:', 'EMMC:')):  
-        parts = target_filename.split(':')  
-        if len(parts) >= 2:  
-            partition_name = parts[1].replace('/', '_').replace('\\', '_')  
-            target_filename = f"patched_{partition_name}.img"  
-            print(f"Converting partition target to file: {target_filename}")  
-      
-    retry_count = 2  
-    for attempt in range(retry_count):  
-        try:  
-            # 异步应用补丁  
-            if patch_data.startswith(b'BSDIFF40'):  
-                # 对于大文件使用进程池  
-                if len(source_file.data) > 10 * 1024 * 1024:  # 10MB以上  
-                    loop = asyncio.get_event_loop()  
-                    with ProcessPoolExecutor() as executor:  
-                        patched_data = await loop.run_in_executor(  
-                            executor, apply_bsdiff_patch, source_file.data, patch_data  
-                        )  
-                else:  
-                    patched_data = apply_bsdiff_patch(source_file.data, patch_data)  
-            elif patch_data.startswith(b'IMGDIFF2'):  
-                patched_data = apply_imgdiff_patch_optimized(source_file.data, patch_data, bonus_data)  
-            else:  
-                print("Unknown patch format")  
-                return False  
-              
-            # 验证大小  
-            if len(patched_data) != target_size:  
-                print(f"Size mismatch: expected {target_size}, got {len(patched_data)}")  
-                if attempt < retry_count - 1:  
-                    print("Retrying...")  
-                    continue  
-                return False  
-              
-            # Python 3.13优化：并行计算SHA1  
-            loop = asyncio.get_event_loop()  
-            actual_sha1 = await loop.run_in_executor(  
-                None, lambda: hashlib.sha1(patched_data, usedforsecurity=False).digest()  
-            )  
-              
-            if actual_sha1 != target_sha1:  
-                print(f"SHA1 mismatch: expected {target_sha1.hex()}, got {actual_sha1.hex()}")  
-                if attempt < retry_count - 1:  
-                    print("Retrying...")  
-                    continue  
-                return False  
-              
-            # 原子写入文件  
-            temp_filename = target_filename + '.patch'  
-            try:  
-                # Python 3.13优化：使用异步文件写入  
-                loop = asyncio.get_event_loop()  
-                await loop.run_in_executor(None, write_file_atomic, temp_filename, patched_data, source_file)  
-                return True  
-                  
-            except Exception as e:  
-                print(f"Failed to write target file: {e}")  
-                if Path(temp_filename).exists():  
+async def generate_target_async(source_file: FileContents, patch_data: bytes,    
+                               target_filename: str, target_sha1: bytes,    
+                               target_size: int, bonus_data: bytes = None) -> bool:    
+    """Async version of target generation with enhanced error handling"""    
+        
+    # 检查是否为分区目标，转换为文件写入    
+    if target_filename.startswith(('MTD:', 'EMMC:')):    
+        parts = target_filename.split(':')    
+        if len(parts) >= 2:    
+            partition_name = parts[1].replace('/', '_').replace('\\', '_')    
+            target_filename = f"patched_{partition_name}.img"    
+            print(f"Converting partition target to file: {target_filename}")    
+        
+    retry_count = 2    
+    for attempt in range(retry_count):    
+        try:    
+            # 异步应用补丁    
+            if patch_data.startswith(b'BSDIFF40'):    
+                # 对于大文件使用进程池    
+                if len(source_file.data) > 10 * 1024 * 1024:  # 10MB以上    
+                    loop = asyncio.get_event_loop()    
                     try:  
-                        Path(temp_filename).unlink()  
-                    except Exception:  
-                        pass  
+                        with ProcessPoolExecutor() as executor:    
+                            patched_data = await loop.run_in_executor(    
+                                executor, apply_bsdiff_patch, source_file.data, patch_data    
+                            )  
+                    except (OSError, MemoryError) as e:  
+                        print(f"Process pool execution failed: {e}")  
+                        if attempt < retry_count - 1:  
+                            print("Retrying with synchronous processing...")  
+                            patched_data = apply_bsdiff_patch(source_file.data, patch_data)  
+                        else:  
+                            return False  
+                    except Exception as e:  
+                        print(f"Unexpected error in process pool: {e}")  
+                        if attempt < retry_count - 1:  
+                            print("Retrying...")  
+                            continue  
+                        return False  
+                else:    
+                    patched_data = apply_bsdiff_patch(source_file.data, patch_data)    
+            elif patch_data.startswith(b'IMGDIFF2'):    
+                try:  
+                    patched_data = apply_imgdiff_patch_optimized(source_file.data, patch_data, bonus_data)  
+                except (ValueError, zlib.error) as e:  
+                    print(f"ImgDiff patch failed: {e}")  
+                    if attempt < retry_count - 1:  
+                        print("Retrying...")  
+                        continue  
+                    return False  
+            else:    
+                print("Unknown patch format")    
+                return False    
+                
+            # 验证大小    
+            if len(patched_data) != target_size:    
+                print(f"Size mismatch: expected {target_size}, got {len(patched_data)}")    
+                if attempt < retry_count - 1:    
+                    print("Retrying...")    
+                    continue    
+                return False    
+                
+            # Python 3.13优化：并行计算SHA1    
+            loop = asyncio.get_event_loop()    
+            try:  
+                actual_sha1 = await loop.run_in_executor(    
+                    None, lambda: hashlib.sha1(patched_data, usedforsecurity=False).digest()    
+                )  
+            except Exception as e:  
+                print(f"SHA1 calculation failed: {e}")  
                 if attempt < retry_count - 1:  
                     print("Retrying...")  
                     continue  
                 return False  
-                  
-        except Exception as e:  
-            print(f"Patch application failed: {e}")  
-            if attempt < retry_count - 1:  
-                print("Retrying...")  
-                continue  
+                
+            if actual_sha1 != target_sha1:    
+                print(f"SHA1 mismatch: expected {target_sha1.hex()}, got {actual_sha1.hex()}")    
+                if attempt < retry_count - 1:    
+                    print("Retrying...")    
+                    continue    
+                return False    
+                
+            # 原子写入文件    
+            temp_filename = target_filename + '.patch'    
+            try:    
+                # Python 3.13优化：使用异步文件写入    
+                loop = asyncio.get_event_loop()    
+                await loop.run_in_executor(None, write_file_atomic, temp_filename, patched_data, source_file)    
+                return True    
+                    
+            except (OSError, PermissionError) as e:    
+                print(f"Failed to write target file: {e}")    
+                if Path(temp_filename).exists():    
+                    try:    
+                        Path(temp_filename).unlink()    
+                    except Exception:    
+                        pass    
+                if attempt < retry_count - 1:    
+                    print("Retrying...")    
+                    continue    
+                return False    
+                    
+        except (MemoryError, OSError) as e:    
+            print(f"System error during patch application: {e}")    
+            if attempt < retry_count - 1:    
+                print("Retrying...")    
+                continue    
             return False  
-      
-    return False  
+        except Exception as e:    
+            print(f"Unexpected error during patch application: {e}")    
+            if attempt < retry_count - 1:    
+                print("Retrying...")    
+                continue    
+            return False    
+        
+    return False
   
 def write_file_atomic(temp_filename: str, data: bytes, source_file: FileContents):  
     """Atomic file write with proper permissions"""  
