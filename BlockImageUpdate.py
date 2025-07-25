@@ -20,7 +20,7 @@ import bsdiff4 # type: ignore
 from typing import Self, List, Dict, Any, Optional, BinaryIO, Iterator, Tuple, Union, AsyncIterator  
 from pathlib import Path  
 import json  
-from contextlib import suppress, contextmanager  
+from contextlib import suppress, contextmanager, redirect_stderr
 from dataclasses import dataclass  
 import logging
 from functools import lru_cache  
@@ -43,7 +43,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)  
 
 try:  
-    from ApplyPatch import apply_bsdiff_patch,apply_imgdiff_patch_optimized
+    from ApplyPatch import apply_bsdiff_patch,apply_imgdiff_patch_streaming
     APPLYPATCH_AVAILABLE = True  
 except ImportError:  
     APPLYPATCH_AVAILABLE = False  
@@ -402,9 +402,9 @@ class BlockImageUpdate:
         
         # Core state  
         self.stash_cache = LRUStashCache(  
-            max_items=50 if not self.large_file_config.enable_streaming else 20,  
-            max_memory_mb=self.large_file_config.memory_limit_mb // 2  
-        )  
+            max_items=5 if self.large_file_config.enable_streaming else 10,  # Much smaller cache  
+            max_memory_mb=min(64, self.large_file_config.memory_limit_mb // 4)  # Very limited memory  
+        )
         self.written = 0  
         self.version = 1  
         self.total_blocks = 0  
@@ -430,8 +430,8 @@ class BlockImageUpdate:
         
         # Enhanced threading for large files  
         self.new_data_queue: queue.Queue[Optional[bytes]] = queue.Queue(  
-            maxsize=self.large_file_config.chunk_size_mb // 4  # 动态队列大小  
-        )  
+            maxsize=max(2, min(4, self.large_file_config.chunk_size_mb // 8))  # Very small queue  
+        )
         self.new_data_producer_thread: Optional[threading.Thread] = None  
         self.new_data_producer_running = threading.Event()  
         self.new_data_condition = threading.Condition()  
@@ -446,14 +446,13 @@ class BlockImageUpdate:
         self.failed_command_details = {}
 
     def _configure_large_file_handling(self) -> LargeFileConfig:  
-        """Configure large file handling based on file sizes and system memory"""  
+        """Configure for extreme memory constraints (2GB RAM, 4-15GB files)"""  
         config = LargeFileConfig()  
         
         try:  
-            # 检测系统内存  
             available_memory_mb = psutil.virtual_memory().available // (1024 * 1024)  
             
-            # 检测文件大小  
+            # Detect file sizes  
             file_sizes = {}  
             for name, path in [  
                 ('new_data', self.new_data_path),  
@@ -466,33 +465,34 @@ class BlockImageUpdate:
             
             max_file_size = max(file_sizes.values()) if file_sizes else 0  
             
-            # 动态调整配置  
-            if max_file_size > 4096:  # >4GB  
-                config.chunk_size_mb = 32  
-                config.memory_limit_mb = min(available_memory_mb // 4, 2048)  
+            # Aggressive configuration for 2GB RAM constraint  
+            if available_memory_mb < 3000:  # Less than 3GB available  
+                config.chunk_size_mb = 4      # Very small chunks  
+                config.memory_limit_mb = 256   # Use only 256MB max  
                 config.enable_streaming = True  
-                config.gc_frequency = 5  
-            elif max_file_size > 1024:  # >1GB  
-                config.chunk_size_mb = 64  
-                config.memory_limit_mb = min(available_memory_mb // 3, 1024)  
+                config.gc_frequency = 1        # Very aggressive GC  
+                config.use_mmap_threshold_mb = 20  # Use mmap for smaller files only  
+            elif max_file_size > 4096:  # >4GB files  
+                config.chunk_size_mb = 8  
+                config.memory_limit_mb = 512  
                 config.enable_streaming = True  
-                config.gc_frequency = 10  
+                config.gc_frequency = 2  
             else:  
                 config.enable_streaming = False  
             
-            logger.info(f"Large file config: {config}")  
-            logger.info(f"File sizes: {file_sizes}")  
-            logger.info(f"Available memory: {available_memory_mb}MB")  
-            
+            logger.info(f"Large file config for memory constraint: {config}")  
             return config  
             
         except Exception as e:  
             logger.warning(f"Failed to configure large file handling: {e}")  
-            return LargeFileConfig()
+            # Fallback to very conservative settings  
+            config.chunk_size_mb = 4  
+            config.memory_limit_mb = 256  
+            config.enable_streaming = True  
+            config.gc_frequency = 1  
+            return config
 
 
-
-      
     def _get_optimal_io_settings(self) -> IOSettings:  
         """Get platform-specific optimal I/O settings"""  
         if os.name == 'nt':  # Windows  
@@ -1057,7 +1057,7 @@ class BlockImageUpdate:
                 result = apply_bsdiff_patch(src_data, patch_data)    
             elif patch_data.startswith(b'IMGDIFF2'):    
                 logger.info(f"Processing IMGDIFF2 patch: size={len(patch_data)}, src_size={len(src_data)}")  
-                result = apply_imgdiff_patch_optimized(src_data, patch_data)    
+                result = apply_imgdiff_patch_streaming(src_data, patch_data)    
             else:    
                 logger.error(f"Unknown patch format: {patch_data[:8].hex()}")    
                 return None    
@@ -1208,17 +1208,21 @@ class BlockImageUpdate:
             return await async_processor.read_blocks_async(f, rangeset)  
   
     def _read_blocks_sync(self, rangeset: RangeSet) -> bytes:  
-        """Synchronous version for small files"""  
+        """Synchronous version optimized for memory constraints"""  
+        # For large ranges, use streaming approach  
+        if rangeset.size > 64:  # >256KB  
+            return self._read_blocks_streaming_sync(rangeset)  
+        
         data = bytearray()  
         
         with self._open_block_device('rb') as f:  
             for start_block, end_block in rangeset:  
                 f.seek(start_block * self.BLOCKSIZE)  
                 
-                # 使用内存管理的分块读取  
+                # Process in very small chunks for memory constraint  
                 remaining_blocks = end_block - start_block  
                 while remaining_blocks > 0:  
-                    chunk_blocks = min(remaining_blocks, self.large_file_config.chunk_size_mb * 256)  
+                    chunk_blocks = min(remaining_blocks, 16)  # Only 64KB at a time  
                     chunk_size = chunk_blocks * self.BLOCKSIZE  
                     
                     chunk_data = f.read(chunk_size)  
@@ -1229,10 +1233,44 @@ class BlockImageUpdate:
                     data.extend(chunk_data)  
                     remaining_blocks -= chunk_blocks  
                     
-                    # 定期进行内存管理  
-                    self._manage_memory()  
+                    # Aggressive memory management every 16 blocks  
+                    if len(data) % (16 * self.BLOCKSIZE) == 0:  
+                        gc.collect()  
         
         return bytes(data)
+
+    def _read_blocks_streaming_sync(self, rangeset: RangeSet) -> bytes:  
+        """Stream large block reads using temporary file to avoid memory pressure"""  
+        temp_file = self.stash_base_dir / f"temp_read_{int(time.time())}.tmp"  
+        
+        try:  
+            with temp_file.open('wb') as temp_fd, self._open_block_device('rb') as f:  
+                for start_block, end_block in rangeset:  
+                    f.seek(start_block * self.BLOCKSIZE)  
+                    
+                    remaining_blocks = end_block - start_block  
+                    while remaining_blocks > 0:  
+                        chunk_blocks = min(remaining_blocks, 8)  # 32KB chunks  
+                        chunk_size = chunk_blocks * self.BLOCKSIZE  
+                        
+                        chunk_data = f.read(chunk_size)  
+                        if len(chunk_data) != chunk_size:  
+                            logger.error(f"Short read: expected {chunk_size}, got {len(chunk_data)}")  
+                            return None  
+                        
+                        temp_fd.write(chunk_data)  
+                        remaining_blocks -= chunk_blocks  
+                        
+                        # Force GC every 8 blocks  
+                        gc.collect()  
+            
+            # Read back from temp file  
+            return temp_file.read_bytes()  
+            
+        finally:  
+            # Clean up temp file  
+            if temp_file.exists():  
+                temp_file.unlink()
 
 
     def _write_blocks(self, rangeset: RangeSet, data: bytes) -> bool:  
@@ -1695,7 +1733,7 @@ class BlockImageUpdate:
                 
                 if result != 0:  
                     logger.error(f"Command {cmd} failed with code {result}")  
-                    self._update_performance_stats('error', error_type='command_failed')  
+                    self._update_performance_stats('error', 'command_failed', error_type='command_failed')  
                     if self.continue_on_error:  
                         logger.warning(f"Continuing execution despite error in {cmd} command")  
                         failed_command_counts[cmd] = failed_command_counts.get(cmd, 0) + 1  
@@ -1716,7 +1754,7 @@ class BlockImageUpdate:
             except Exception as e:  
                 logger.error(f"Exception executing command {cmd}: {e}")  
                 self._update_performance_stats('command', 'end', command=cmd, success=False)  
-                self._update_performance_stats('error', error_type='command_exception')  
+                self._update_performance_stats('error', 'command_exception', error_type='command_exception')
                 
                 if self.continue_on_error:  
                     logger.warning(f"Continuing execution despite exception in {cmd} command")  
@@ -1782,68 +1820,51 @@ class BlockImageUpdate:
 
 
     def _manage_memory(self):  
-        """Enhanced memory management for large file processing with adaptive strategies"""  
+        """Enhanced memory management for 2GB RAM constraint"""  
         current_time = time.time()  
         
         try:  
-            # 获取当前内存使用情况  
             process = psutil.Process()  
             memory_info = process.memory_info()  
             memory_mb = memory_info.rss // (1024 * 1024)  
             memory_percent = process.memory_percent()  
             
-            # 更新流式处理状态  
+            # Update streaming state  
             self.streaming_state['memory_usage'] = memory_mb  
             
-            # 定期垃圾回收策略  
-            gc_interval = self.large_file_config.gc_frequency  
-            if current_time - self._last_gc_time > gc_interval:  
-                # 根据内存压力调整垃圾回收强度  
-                if memory_percent > 80:  
-                    # 高内存压力：强制完整垃圾回收  
-                    collected = gc.collect()  
-                    gc.collect()  # 二次回收  
-                    logger.info(f"High memory pressure: collected {collected} objects (full GC)")  
-                elif memory_percent > 60:  
-                    # 中等内存压力：标准垃圾回收  
-                    collected = gc.collect()  
-                    logger.debug(f"Medium memory pressure: collected {collected} objects")  
-                else:  
-                    # 低内存压力：轻量垃圾回收  
-                    collected = gc.collect(0)  # 只回收第0代  
-                    if collected > 0:  
-                        logger.debug(f"Light GC: collected {collected} objects")  
-                
+            # Much more aggressive thresholds for 2GB constraint  
+            if memory_mb > 1024:  # Using more than 1GB  
+                self._emergency_memory_cleanup()  
+            elif memory_mb > 768:  # Using more than 768MB  
+                self._aggressive_memory_cleanup()  
+            elif memory_mb > 512:  # Using more than 512MB  
+                self._gentle_memory_cleanup()  
+            
+            # Force GC every 10 seconds for memory constraint  
+            if current_time - self._last_gc_time > 10:  
+                collected = gc.collect()  
+                if collected > 0:  
+                    logger.debug(f"Forced GC: collected {collected} objects")  
                 self._last_gc_time = current_time  
             
-            # 内存压力检测和响应  
-            memory_limit = self.large_file_config.memory_limit_mb  
-            
-            if memory_mb > memory_limit:  
-                logger.warning(f"Memory limit exceeded: {memory_mb}MB > {memory_limit}MB ({memory_percent:.1f}%)")  
-                
-                # 分级内存清理策略  
-                if memory_percent > 90:  
-                    # 紧急情况：激进清理  
-                    self._emergency_memory_cleanup()  
-                elif memory_percent > 75:  
-                    # 严重情况：主动清理  
-                    self._aggressive_memory_cleanup()  
-                else:  
-                    # 一般情况：温和清理  
-                    self._gentle_memory_cleanup()  
-            
-            # 监控队列大小并调整  
+            # Monitor queue size and clear if too large  
             queue_size = self.new_data_queue.qsize()  
-            if queue_size > self.new_data_queue.maxsize * 0.8:  
-                logger.debug(f"Queue nearly full: {queue_size}/{self.new_data_queue.maxsize}")  
-                
-            # 定期报告内存状态（调试模式）  
-            if logger.isEnabledFor(logging.DEBUG) and current_time % 30 < 1:  # 每30秒  
-                self._log_memory_stats(memory_mb, memory_percent)  
-                
+            if queue_size > 4:  # Very small queue for memory constraint  
+                logger.warning(f"Queue size {queue_size} too large, clearing excess")  
+                cleared = 0  
+                while queue_size > 2 and not self.new_data_queue.empty():  
+                    try:  
+                        self.new_data_queue.get_nowait()  
+                        cleared += 1  
+                        queue_size -= 1  
+                    except queue.Empty:  
+                        break  
+                if cleared > 0:  
+                    logger.info(f"Cleared {cleared} queue items to manage memory")  
+                    
         except Exception as e:  
-            logger.warning(f"Memory management error: {e}")  
+            logger.warning(f"Memory management error: {e}")
+
     
     def _emergency_memory_cleanup(self):  
         """Emergency memory cleanup for critical memory pressure"""  
@@ -2765,6 +2786,94 @@ def main():
     except Exception as e:  
         print(f"Fatal error: {e}")  
         return -1
+
+class ErrorLogHandler:  
+    log_file = 'errors.txt'  # Add this class attribute  
+      
+    def __init__(self, log_file='errors.txt'):  
+        self.log_file = log_file  # Keep instance attribute too  
+        self._setup_logger()  
+  
+    def _setup_logger(self):  
+        """Configure logger to retain current run logs and capture all warning+ level info"""  
+        self.logger = logging.getLogger('error_logger')  
+        self.logger.setLevel(logging.WARNING)  # Record WARNING and above levels  
+          
+        # File handler (auto-overwrite each run)  
+        file_handler = logging.FileHandler(self.log_file, mode='w', encoding='utf-8')  
+        file_handler.setFormatter(logging.Formatter(  
+            '[%(asctime)s] %(levelname)s: %(message)s\n'  
+            'File: %(filename)s:%(lineno)d\n\n'  
+        ))  
+  
+        # Console handler (optional)  
+        console_handler = logging.StreamHandler()  
+        console_handler.setLevel(logging.INFO)  # Console shows INFO and above only  
+          
+        self.logger.addHandler(file_handler)  
+        self.logger.addHandler(console_handler)  
+  
+    def capture_errors(self, func, *args, **kwargs):  
+        """Decorator pattern to capture errors during function execution"""  
+        try:  
+            with redirect_stderr(self.logger.handlers[0].stream):  
+                return func(*args, **kwargs)  
+        except Exception as e:  
+            self.logger.error(f"Critical error occurred: {str(e)}", exc_info=True)  
+            raise
+
+def main():  
+    """Enhanced main function with logging and detailed error display"""  
+    # Initialize logging system (auto-clear old logs)  
+    error_handler = ErrorLogHandler()  
+  
+    # Parameter parsing  
+    if len(sys.argv) < 5:  
+        print(f"Usage: {sys.argv[0]} <system.img> <system.transfer.list> "  
+              "<system.new.dat> <system.patch.dat> [--continue-on-error]")  
+        return 1  
+  
+    continue_on_error = '--continue-on-error' in sys.argv  
+  
+    # Main processing flow  
+    try:  
+        with BlockImageUpdate(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4],  
+                             continue_on_error=continue_on_error) as biu:  
+            result = biu.process_transfer_list()  
+  
+            if result == 0:  
+                print("Done")  
+            else:  
+                error_message = f"Done with error code: {result}"  
+                if continue_on_error and hasattr(biu, 'failed_command_details'):  
+                    failure_details = ", ".join(  
+                        f"{cmd}:{count}"   
+                        for cmd, count in sorted(biu.failed_command_details.items())  
+                    )  
+                    error_message += f" (Failed commands: {failure_details})"  
+                      
+                # Print the detailed error message to console  
+                print(f"Error: {error_message}")  
+                error_handler.logger.error(error_message)  
+                return result  
+  
+    except Exception as e:  
+        # Print the specific exception details to console  
+        print(f"Fatal error occurred: {str(e)}")  
+        print(f"Error type: {type(e).__name__}")  
+          
+        # If it's a specific BIU-related error, provide more context  
+        if hasattr(e, '__traceback__'):  
+            import traceback  
+            print("Error traceback:")  
+            traceback.print_exc()  
+          
+        # Also log to file for detailed analysis  
+        error_handler.logger.error(f"Fatal error: {str(e)}", exc_info=True)  
+        print(f"\nDetailed error log saved to: {error_handler.log_file}")  
+        return -1  
+  
+    return 0
 
 
   
