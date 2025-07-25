@@ -29,6 +29,36 @@ import weakref
 import psutil  # 用于内存监控  
 import gc      # 垃圾回收控制  
 
+def safe_mmap(fd, length, access=mmap.ACCESS_READ):
+    try:
+        return mmap.mmap(fd.fileno(), length, access=access)
+    except Exception as e:
+        print(f"mmap failed, fallback to read: {e}")
+        fd.seek(0)
+        return fd.read()
+
+def run_applypatch_py(cmd_args, cwd=None):
+    cmd_args = [str(arg) for arg in cmd_args]
+    if os.name == 'nt':
+        cmd_args = [f'"{arg}"' if ' ' in arg else arg for arg in cmd_args]
+    try:
+        result = subprocess.run(cmd_args, capture_output=True, text=True, timeout=300, cwd=cwd)
+        if result.returncode != 0:
+            print(f"ApplyPatch.py failed: {result.stderr}")
+            return None
+        return result.stdout
+    except Exception as e:
+        print(f"Failed to run ApplyPatch.py: {e}")
+        return None
+
+def read_bin_file(filename):
+    with open(filename, 'rb') as f:
+        return f.read()
+def write_bin_file(filename, data):
+    with open(filename, 'wb') as f:
+        f.write(data)
+        
+    
 @dataclass  
 class LargeFileConfig:  
     """Large file processing configuration"""  
@@ -770,7 +800,7 @@ class BlockImageUpdate:
                     f.seek(offset)  
                       
                     for block in range(start_block, end_block):  
-                        f.write(zero_block)  
+                        write_bin_file(zero_block)  
                       
                     # Sync based on platform  
                     if self.io_settings.sync_method == 'fsync':  
@@ -950,7 +980,7 @@ class BlockImageUpdate:
             with self.patch_data_lock:  
                 # Extract patch data using memory mapping if available    
                 if self.patch_data_mmap:    
-                    patch_data = bytes(self.patch_data_mmap[offset:offset + length])    
+                    patch_data = safe_mmap(self.patch_data_fd, length)    
                 else:    
                     self.patch_data_fd.seek(offset)    
                     patch_data = self.patch_data_fd.read(length)    
@@ -1105,9 +1135,8 @@ class BlockImageUpdate:
                 ]  
                   
                 # Execute with timeout  
-                result = subprocess.run(  
-                    cmd, capture_output=True, text=True,   
-                    timeout=300, cwd=Path.cwd()  
+                result = run_applypatch_py(  
+                    cmd,cwd=Path.cwd()  
                 )  
                   
                 if result.returncode != 0:  
@@ -1225,7 +1254,7 @@ class BlockImageUpdate:
                     chunk_blocks = min(remaining_blocks, 16)  # Only 64KB at a time  
                     chunk_size = chunk_blocks * self.BLOCKSIZE  
                     
-                    chunk_data = f.read(chunk_size)  
+                    chunk_data = read_bin_file(chunk_size)  
                     if len(chunk_data) != chunk_size:  
                         logger.error(f"Short read: expected {chunk_size}, got {len(chunk_data)}")  
                         return None  
@@ -1253,7 +1282,7 @@ class BlockImageUpdate:
                         chunk_blocks = min(remaining_blocks, 8)  # 32KB chunks  
                         chunk_size = chunk_blocks * self.BLOCKSIZE  
                         
-                        chunk_data = f.read(chunk_size)  
+                        chunk_data = read_bin_file(chunk_size)  
                         if len(chunk_data) != chunk_size:  
                             logger.error(f"Short read: expected {chunk_size}, got {len(chunk_data)}")  
                             return None  

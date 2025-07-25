@@ -51,10 +51,14 @@ CHUNK_RAW = 3
 HAS_BSDIFF4 = 1  
   
 # Cache path for cross-platform compatibility  
-if os.name == 'nt':  
-    CACHE_TEMP_SOURCE = Path(tempfile.gettempdir()) / "applypatch_cache" / "temp_source"  
-else:  
-    CACHE_TEMP_SOURCE = Path("/tmp/applypatch_cache/temp_source")  
+def get_cache_temp_source():
+    if os.name == 'nt':
+        temp_dir = Path(tempfile.gettempdir()) / "applypatch_cache"
+    else:
+        temp_dir = Path("/tmp/applypatch_cache")
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    return temp_dir / "temp_source"
+CACHE_TEMP_SOURCE = get_cache_temp_source()
   
 @contextmanager  
 def cache_manager():  
@@ -86,7 +90,7 @@ def cache_manager():
                         import time  
                         time.sleep(0.1)  
                     else:  
-                        logger.error(f"Failed to clean cache after {max_retries} attempts: {e}")
+                        logger.error(f"Failed to clean cache after {max_retries} attempts: {e}", exc_info=True)
   
 def parse_sha1(sha1_str: str) -> bytes:  
     """Parse SHA1 string to bytes, handling format '<digest>:<anything>'"""  
@@ -195,7 +199,20 @@ def apply_bsdiff_patch(source_data: bytes, patch_data: bytes) -> bytes:
             raise RuntimeError(f"BSDiff patch application failed: {e}") from e  
     else:  
         raise RuntimeError("bsdiff4 module is required but not available. Install with: pip install bsdiff4")  
-  
+
+def patch_with_bonus(uncompressed_source, bonus_data, expanded_len, chunk_idx):
+    if bonus_data and expanded_len > len(uncompressed_source):
+        bonus_size = expanded_len - len(uncompressed_source)
+        if bonus_size <= len(bonus_data):
+            uncompressed_source += bonus_data[:bonus_size]
+            logger.debug(f"Applied {bonus_size} bytes of bonus data to chunk {chunk_idx}")
+    return uncompressed_source
+
+
+def compress_deflate(data, level, window_bits, mem_level, strategy):
+    compressor = zlib.compressobj(level=level, wbits=window_bits, memLevel=mem_level, strategy=strategy)
+    return compressor.compress(data) + compressor.flush()
+
 def apply_imgdiff_patch_streaming(source_data: bytes, patch_data: bytes, bonus_data: bytes = None) -> bytes:  
     """Apply ImgDiff patch with streaming for memory efficiency"""  
       
@@ -356,12 +373,8 @@ def process_compressed_chunk(chunk_idx: int, chunk_type: int, source_data: bytes
         raise ValueError(f"Failed to decompress chunk {chunk_idx}: {e}")  
       
     # 处理 bonus data  
-    if bonus_data and expanded_len > len(uncompressed_source):  
-        bonus_size = expanded_len - len(uncompressed_source)  
-        if bonus_size <= len(bonus_data):  
-            uncompressed_source += bonus_data[:bonus_size]  
-            logger.debug(f"Applied {bonus_size} bytes of bonus data to chunk {chunk_idx}")  
-      
+    uncompressed_source = patch_with_bonus(uncompressed_source, bonus_data, expanded_len, chunk_idx)
+
     # 应用 bsdiff 补丁  
     chunk_patch = patch_data[patch_offset:]  
     patched_uncompressed = apply_bsdiff_patch(uncompressed_source, chunk_patch)  
@@ -372,7 +385,7 @@ def process_compressed_chunk(chunk_idx: int, chunk_type: int, source_data: bytes
             result = zlib.compress(patched_uncompressed, level=compression_level, wbits=16 + zlib.MAX_WBITS)  
         else:  # CHUNK_DEFLATE  
             # 使用读取的压缩参数  
-            compressor = zlib.compressobj(level=compression_level, wbits=window_bits,  
+            compressor = uncompressed_source(level=compression_level, wbits=window_bits,  
                                         memLevel=mem_level, strategy=strategy)  
             result = compressor.compress(patched_uncompressed) + compressor.flush()  
     except zlib.error as e:  
@@ -432,7 +445,7 @@ async def generate_target_async(source_file: FileContents, patch_data: bytes,
                 try:  
                     patched_data = apply_imgdiff_patch_streaming(source_file.data, patch_data, bonus_data)  
                 except (ValueError, zlib.error) as e:  
-                    logger.error(f"ImgDiff patch failed: {e}")  
+                    logger.error(f"ImgDiff patch failed: {e}", exc_info=True)  
                     if attempt < retry_count - 1:  
                         continue  
                     return False  
@@ -462,7 +475,7 @@ async def generate_target_async(source_file: FileContents, patch_data: bytes,
             return True  
               
         except Exception as e:  
-            logger.error(f"Error during patch application: {e}")  
+            logger.error(f"Error during patch application: {e}", exc_info=True)  
             if attempt < retry_count - 1:  
                 continue  
             return False  
@@ -572,20 +585,20 @@ def generate_target_sync(source_file: FileContents, patch_data: bytes,
                 return True  
               
             except (OSError, PermissionError, IOError) as e:  
-                logger.error(f"Failed to write target file: {e}")  
+                logger.error(f"Failed to write target file: {e}", exc_info=True)  
                 if attempt < retry_count - 1:  
                     logger.info("Retrying...")  
                     continue  
                 return False  
           
         except (ValueError, RuntimeError) as e:  
-            logger.error(f"Patch application failed: {e}")  
+            logger.error(f"Patch application failed: {e}", exc_info=True)  
             if attempt < retry_count - 1:  
                 logger.info("Retrying...")  
                 continue  
             return False  
         except Exception as e:  
-            logger.error(f"Unexpected error: {e}")  
+            logger.error(f"Unexpected error: {e}", exc_info=True)  
             if attempt < retry_count - 1:  
                 logger.info("Retrying...")  
                 continue  
@@ -593,27 +606,22 @@ def generate_target_sync(source_file: FileContents, patch_data: bytes,
       
     return False  
   
-def save_file_contents(filename: str, file_contents: FileContents) -> bool:  
-    """Save file contents to disk with proper permissions and error handling"""  
-    try:  
-        # 确保目录存在  
-        Path(filename).parent.mkdir(parents=True, exist_ok=True)  
-          
-        with open(filename, 'wb') as f:  
-            f.write(file_contents.data)  
-          
-        # 设置文件权限（跨平台兼容）  
-        try:  
-            os.chmod(filename, file_contents.st_mode)  
-            if hasattr(os, 'chown') and os.name != 'nt':  # 非Windows系统  
-                os.chown(filename, file_contents.st_uid, file_contents.st_gid)  
-        except (OSError, PermissionError) as e:  
-            logger.warning(f"Failed to set file permissions for {filename}: {e}")  
-          
-        return True  
-    except (OSError, IOError) as e:  
-        logger.error(f"Failed to save file {filename}: {e}")  
-        return False  
+def save_file_contents(filename: str, file_contents: FileContents) -> bool:
+    try:
+        Path(filename).parent.mkdir(parents=True, exist_ok=True)
+        with open(filename, 'wb') as f:
+            f.write(file_contents.data)
+        try:
+            if os.name != 'nt':
+                os.chmod(filename, file_contents.st_mode)
+                if hasattr(os, 'chown'):
+                    os.chown(filename, file_contents.st_uid, file_contents.st_gid)
+        except Exception as e:
+            logger.warning(f"Failed to set file permissions for {filename}: {e}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to save file {filename}: {e}", exc_info=True)
+        return False
   
 def applypatch_check(filename: str, patch_sha1_list: List[str]) -> bool:  
     """Check if file matches any of the expected SHA1 sums"""  
@@ -641,7 +649,7 @@ def applypatch_with_cache(source_filename: str, target_filename: str,
         try:  
             target_sha1 = parse_sha1(target_sha1_str)  
         except (ValueError, TypeError) as e:  
-            logger.error(f"Failed to parse target SHA1: {e}")  
+            logger.error(f"Failed to parse target SHA1: {e}", exc_info=True)  
             return 1  
           
         # 检查目标文件是否已经正确  
@@ -659,7 +667,7 @@ def applypatch_with_cache(source_filename: str, target_filename: str,
         try:  
             source_file = load_file_contents(source_filename)  
         except (FileNotFoundError, OSError, IOError) as e:  
-            logger.error(f"Failed to load source file: {e}")  
+            logger.error(f"Failed to load source file: {e}", exc_info=True)  
           
         # 查找匹配的补丁  
         patch_index = -1  
@@ -667,7 +675,7 @@ def applypatch_with_cache(source_filename: str, target_filename: str,
             try:  
                 patch_index = find_matching_patch(source_file.sha1, patch_sha1_list)  
             except (TypeError, ValueError) as e:  
-                logger.error(f"Error finding matching patch: {e}")  
+                logger.error(f"Error finding matching patch: {e}", exc_info=True)  
           
         # 尝试从缓存加载  
         if patch_index < 0:  
@@ -698,7 +706,7 @@ def applypatch_with_cache(source_filename: str, target_filename: str,
             with open(patch_files[patch_index], 'rb') as f:  
                 patch_data = f.read()  
         except (FileNotFoundError, OSError, IOError) as e:  
-            logger.error(f"Failed to load patch file: {e}")  
+            logger.error(f"Failed to load patch file: {e}", exc_info=True)  
             return 1  
           
         # 应用补丁  
@@ -709,13 +717,13 @@ def applypatch_with_cache(source_filename: str, target_filename: str,
         else:  
             return 1
   
-def check_python_version():  
-    """Check Python version compatibility"""  
-    if sys.version_info < (3, 8):  
-        print("Warning: This script is designed for Python 3.8+")  
-        print(f"Current version: {sys.version}")  
-    elif sys.version_info >= (3, 13):  
-        print(f"Running on Python {sys.version_info.major}.{sys.version_info.minor}")  
+def check_python_version():
+    if sys.version_info < (3, 8):
+        print("Warning: This script is designed for Python 3.8+")
+        print(f"Current version: {sys.version}")
+    elif sys.version_info >= (3, 13):
+        print(f"Running on Python {sys.version_info.major}.{sys.version_info.minor}")
+
   
 def main():  
     """Main function with enhanced error handling and resource management"""  
@@ -755,7 +763,7 @@ def main():
             with open(bonus_filename, 'rb') as f:  
                 bonus_data = f.read()  
         except (FileNotFoundError, OSError, IOError) as e:  
-            logger.error(f"Failed to load bonus file: {e}")  
+            logger.error(f"Failed to load bonus file: {e}", exc_info=True)  
             return 1  
     else:  
         patch_args = remaining_args  
