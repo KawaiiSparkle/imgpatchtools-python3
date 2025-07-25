@@ -7,7 +7,6 @@ Optimized for transfer.list V4 command parsing and execution
 import asyncio
 import sys  
 import os  
-import subprocess  
 import struct  
 import hashlib  
 import tempfile  
@@ -16,7 +15,6 @@ import time
 import queue  
 import mmap  
 import ctypes  
-import bsdiff4 # type: ignore
 from typing import Self, List, Dict, Any, Optional, BinaryIO, Iterator, Tuple, Union, AsyncIterator  
 from pathlib import Path  
 import json  
@@ -31,25 +29,14 @@ import gc      # 垃圾回收控制
 
 def safe_mmap(fd, length, access=mmap.ACCESS_READ):
     try:
-        return mmap.mmap(fd.fileno(), length, access=access)
+        mm = mmap.mmap(fd.fileno(), length, access=access)
+        data = mm[:]
+        mm.close()
+        return data
     except Exception as e:
         print(f"mmap failed, fallback to read: {e}")
         fd.seek(0)
-        return fd.read()
-
-def run_applypatch_py(cmd_args, cwd=None):
-    cmd_args = [str(arg) for arg in cmd_args]
-    if os.name == 'nt':
-        cmd_args = [f'"{arg}"' if ' ' in arg else arg for arg in cmd_args]
-    try:
-        result = subprocess.run(cmd_args, capture_output=True, text=True, timeout=300, cwd=cwd)
-        if result.returncode != 0:
-            print(f"ApplyPatch.py failed: {result.stderr}")
-            return None
-        return result.stdout
-    except Exception as e:
-        print(f"Failed to run ApplyPatch.py: {e}")
-        return None
+        return fd.read(length)
 
 def read_bin_file(filename):
     with open(filename, 'rb') as f:
@@ -57,6 +44,21 @@ def read_bin_file(filename):
 def write_bin_file(filename, data):
     with open(filename, 'wb') as f:
         f.write(data)
+
+def ensure_bytes(data):
+    if isinstance(data, (bytes, bytearray)):
+        return data
+    elif hasattr(data, "tobytes"):
+        return data.tobytes()
+    elif hasattr(data, "__getitem__"):
+        return bytes(data)
+    else:
+        raise TypeError(f"Unsupported data type for patch: {type(data)}")
+
+def read_patch_bytes(path, offset, length):
+    with open(path, 'rb') as fd:
+        fd.seek(offset)
+        return fd.read(length)
         
     
 @dataclass  
@@ -929,77 +931,76 @@ class BlockImageUpdate:
             return -1  
   
   
-    def perform_command_diff(self, tokens: List[str], pos: int, cmd_name: str) -> int:    
-        """Apply diff patches with thread-safe patch data access"""    
-        if pos + 1 >= len(tokens):    
-            logger.error(f"Missing patch offset or length for {cmd_name}")    
-            return -1    
-    
-        try:    
-            offset = int(tokens[pos])    
-            length = int(tokens[pos + 1])    
-            pos += 2    
-    
-            # Parse based on transfer list version    
-            if self.version >= 3:    
-                if pos + 4 >= len(tokens):    
-                    logger.error("Missing required parameters for version 3+ diff")    
-                    return -1    
-                
-                src_hash = tokens[pos]    
-                tgt_hash = tokens[pos + 1]    
-                tgt_range = tokens[pos + 2]    
-                src_blocks = int(tokens[pos + 3])    
-                pos += 4    
-    
-                tgt_rangeset = RangeSet(tgt_range)    
-                
-                # Load source data using version 3 loader    
-                try:    
-                    _, src_data, _, _ = self._load_src_tgt_version3(tokens, pos - 4, onehash=False)    
-                except Exception as e:    
-                    logger.error(f"Failed to load source data: {e}")    
-                    return -1    
-                    
-            else:    
-                # Version 1/2 handling    
-                if pos + 1 >= len(tokens):    
-                    logger.error("Missing target/source ranges for version 1/2 diff")    
-                    return -1    
-                    
-                tgt_rangeset = RangeSet(tokens[pos])    
-                src_rangeset = RangeSet(tokens[pos + 1])    
-                src_data = self._read_blocks(src_rangeset)    
-                tgt_hash = None    
-                
-                if src_data is None:    
-                    logger.error("Failed to read source blocks")    
-                    return -1    
-    
-            # 使用锁保护补丁数据访问  
-            with self.patch_data_lock:  
-                # Extract patch data using memory mapping if available    
-                if self.patch_data_mmap:    
-                    patch_data = safe_mmap(self.patch_data_fd, length)    
-                else:    
-                    self.patch_data_fd.seek(offset)    
-                    patch_data = self.patch_data_fd.read(length)    
-    
-            # Apply patch with proper error handling    
-            result = self._apply_patch_internal(src_data, patch_data, cmd_name, tgt_hash)    
-            if result is None:    
-                return -1    
-    
-            # Write result using RangeSink with proper block alignment    
-            if not self._write_blocks(tgt_rangeset, result):    
-                logger.error("Failed to write patched blocks")    
-                return -1    
-    
-            self.written += tgt_rangeset.size    
-            return 0    
-    
-        except Exception as e:    
-            logger.error(f"Failed to apply {cmd_name} patch: {e}")    
+    def perform_command_diff(self, tokens: List[str], pos: int, cmd_name: str) -> int:
+        """Apply diff patches safely for large patch.dat on Windows (no global fd/mmap)"""
+        if pos + 1 >= len(tokens):
+            logger.error(f"Missing patch offset or length for {cmd_name}")
+            return -1
+
+        try:
+            offset = int(tokens[pos])
+            length = int(tokens[pos + 1])
+            pos += 2
+
+            # 安全读取patch片段（避免全局fd/mmap，兼容大文件和Windows）
+            def read_patch_bytes(path, offset, length):
+                with open(path, 'rb') as fd:
+                    fd.seek(offset)
+                    return fd.read(length)
+
+            patch_data = read_patch_bytes(self.patch_data_path, offset, length)
+
+            # Parse based on transfer list version
+            if self.version >= 3:
+                if pos + 4 >= len(tokens):
+                    logger.error("Missing required parameters for version 3+ diff")
+                    return -1
+
+                src_hash = tokens[pos]
+                tgt_hash = tokens[pos + 1]
+                tgt_range = tokens[pos + 2]
+                src_blocks = int(tokens[pos + 3])
+                pos += 4
+
+                tgt_rangeset = RangeSet(tgt_range)
+
+                # Load source data using version 3 loader
+                try:
+                    _, src_data, _, _ = self._load_src_tgt_version3(tokens, pos - 4, onehash=False)
+                except Exception as e:
+                    logger.error(f"Failed to load source data: {e}")
+                    return -1
+
+            else:
+                # Version 1/2 handling
+                if pos + 1 >= len(tokens):
+                    logger.error("Missing target/source ranges for version 1/2 diff")
+                    return -1
+
+                tgt_rangeset = RangeSet(tokens[pos])
+                src_rangeset = RangeSet(tokens[pos + 1])
+                src_data = self._read_blocks(src_rangeset)
+                tgt_hash = None
+
+                if src_data is None:
+                    logger.error("Failed to read source blocks")
+                    return -1
+
+            patch_data = ensure_bytes(patch_data)
+            result = self._apply_patch_internal(src_data, patch_data, cmd_name, tgt_hash)
+            if result is None:
+                return -1
+
+            # Write result using RangeSink with proper block alignment
+            if not self._write_blocks(tgt_rangeset, result):
+                logger.error("Failed to write patched blocks")
+                return -1
+
+            self.written += tgt_rangeset.size
+            return 0
+
+        except Exception as e:
+            logger.error(f"Failed to apply {cmd_name} patch: {e}")
             return -1
 
 
@@ -1078,7 +1079,9 @@ class BlockImageUpdate:
     def _apply_patch_internal(self, src_data: bytes, patch_data: bytes,     
                             cmd_name: str, expected_tgt_hash: str) -> Optional[bytes]:    
         """Apply patch using imported ApplyPatch functions with basic error handling"""    
-        try:    
+        try:
+            src_data = ensure_bytes(src_data)
+            patch_data = ensure_bytes(patch_data)    
             # 确保 src_data 是 bytes 类型  
             if isinstance(src_data, bytearray):    
                 src_data = bytes(src_data)    
@@ -1104,51 +1107,6 @@ class BlockImageUpdate:
         except Exception as e:    
             logger.error(f"Failed to apply patch: {e}")    
             return None
-
-
-
-    def _apply_patch_external(self, src_data: bytes, patch_data: bytes,   
-                            cmd_name: str, expected_tgt_hash: str) -> Optional[bytes]:  
-        """Apply patch using external ApplyPatch.py"""  
-        try:  
-            with tempfile.TemporaryDirectory() as temp_dir:  
-                temp_dir_path = Path(temp_dir)  
-                  
-                # Create temporary files  
-                temp_src = temp_dir_path / "source.dat"  
-                temp_patch = temp_dir_path / "patch.dat"  
-                temp_tgt = temp_dir_path / "target.dat"  
-                  
-                temp_src.write_bytes(src_data)  
-                temp_patch.write_bytes(patch_data)  
-                  
-                # Calculate source SHA1 and estimate target size  
-                src_sha1 = hashlib.sha1(src_data).hexdigest()  
-                target_size = self._estimate_target_size(patch_data, len(src_data))  
-                  
-                # Build command  
-                cmd = [  
-                    sys.executable, 'ApplyPatch.py',  
-                    str(temp_src), str(temp_tgt),  
-                    expected_tgt_hash, str(target_size),  
-                    src_sha1, str(temp_patch)  
-                ]  
-                  
-                # Execute with timeout  
-                result = run_applypatch_py(  
-                    cmd,cwd=Path.cwd()  
-                )  
-                  
-                if result.returncode != 0:  
-                    logger.error(f"ApplyPatch.py failed: {result.stderr}")  
-                    return None  
-                  
-                # Read result  
-                return temp_tgt.read_bytes()  
-                  
-        except Exception as e:  
-            logger.error(f"Failed to apply patch externally: {e}")  
-            return None  
   
     def _estimate_target_size(self, patch_data: bytes, src_data_len: int) -> int:  
         """Estimate target file size based on patch header"""  

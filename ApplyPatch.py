@@ -8,8 +8,7 @@ import tempfile
 import shutil  
 import zlib  
 from typing import List, Optional, Tuple, Union, Iterator  
-import subprocess  
-import bsdiff4   # type: ignore  
+import bsdiff4
 import asyncio  
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor  
 import mmap  
@@ -49,7 +48,17 @@ CHUNK_GZIP = 1
 CHUNK_DEFLATE = 2  
 CHUNK_RAW = 3  
 HAS_BSDIFF4 = 1  
-  
+
+def ensure_bytes(data):
+    if isinstance(data, (bytes, bytearray)):
+        return data
+    elif hasattr(data, "tobytes"):
+        return data.tobytes()
+    elif hasattr(data, "__getitem__"):
+        return bytes(data)
+    else:
+        raise TypeError(f"Unsupported data type for patch: {type(data)}")
+    
 # Cache path for cross-platform compatibility  
 def get_cache_temp_source():
     if os.name == 'nt':
@@ -425,7 +434,8 @@ async def generate_target_async(source_file: FileContents, patch_data: bytes,
                 loop = asyncio.new_event_loop()  
                 asyncio.set_event_loop(loop)  
               
-            # 异步应用补丁  
+            # 异步应用补丁
+            patch_data = ensure_bytes(patch_data)  
             if patch_data.startswith(b'BSDIFF40'):  
                 if len(source_file.data) > 10 * 1024 * 1024:  # 10MB以上  
                     try:  
@@ -553,7 +563,8 @@ def generate_target_sync(source_file: FileContents, patch_data: bytes,
     retry_count = 2  
     for attempt in range(retry_count):  
         try:  
-            # 应用补丁  
+            # 应用补丁
+            patch_data = ensure_bytes(patch_data)  
             if patch_data.startswith(b'BSDIFF40'):  
                 patched_data = apply_bsdiff_patch(source_file.data, patch_data)  
             elif patch_data.startswith(b'IMGDIFF2'):  
