@@ -27,6 +27,8 @@ import weakref
 import psutil  # 用于内存监控  
 import gc      # 垃圾回收控制  
 
+logger = logging.getLogger("BlockImageUpdate")
+
 def safe_mmap(fd, length, access=mmap.ACCESS_READ):
     try:
         mm = mmap.mmap(fd.fileno(), length, access=access)
@@ -423,59 +425,57 @@ class BlockImageUpdate:
       
     BLOCKSIZE = 4096  
       
-    def __init__(self, blockdev_path: str, transfer_list_path: str, new_data_path: str, patch_data_path: str, continue_on_error: bool = False):  
-        self.blockdev_path = Path(blockdev_path)  
-        self.transfer_list_path = Path(transfer_list_path)  
-        self.new_data_path = Path(new_data_path)  
-        self.patch_data_path = Path(patch_data_path)  
+    def __init__(self, blockdev_path: str, transfer_list_path: str, new_data_path: str, patch_data_path: str, continue_on_error: bool = False):
+        self.blockdev_path = Path(blockdev_path)
+        self.transfer_list_path = Path(transfer_list_path)
+        self.new_data_path = Path(new_data_path)
+        self.patch_data_path = Path(patch_data_path)
         
         # 检测文件大小并配置处理策略  
-        self.large_file_config = self._configure_large_file_handling()  
+        self.large_file_config = self._configure_large_file_handling()
         
         # Core state  
-        self.stash_cache = LRUStashCache(  
-            max_items=5 if self.large_file_config.enable_streaming else 10,  # Much smaller cache  
-            max_memory_mb=min(64, self.large_file_config.memory_limit_mb // 4)  # Very limited memory  
+        self.stash_cache = LRUStashCache(
+            max_items=5 if self.large_file_config.enable_streaming else 10,
+            max_memory_mb=min(64, self.large_file_config.memory_limit_mb // 4)
         )
-        self.written = 0  
-        self.version = 1  
-        self.total_blocks = 0  
-        self.transfer_lines: List[str] = []  
+        self.written = 0
+        self.version = 1
+        self.total_blocks = 0
+        self.transfer_lines: List[str] = []
         
-        # File descriptors with streaming support  
-        self.new_data_fd: Optional[BinaryIO] = None  
-        self.patch_data_fd: Optional[BinaryIO] = None  
-        self.patch_data_mmap: Optional[mmap.mmap] = None  
+        # REMOVE all global file descriptors!
         
         # 添加文件访问锁和流式处理状态  
-        self.new_data_lock = threading.RLock()  
-        self.patch_data_lock = threading.RLock()  
-        self.streaming_state = {  
-            'current_chunk': 0,  
-            'total_chunks': 0,  
-            'memory_usage': 0  
-        }  
+        self.new_data_lock = threading.RLock()
+        self.patch_data_lock = threading.RLock()
+        self.streaming_state = {
+            'current_chunk': 0,
+            'total_chunks': 0,
+            'memory_usage': 0
+        }
         
         # Platform-specific setup  
-        self.io_settings = self._get_optimal_io_settings()  
-        self.stash_base_dir = self._get_stash_directory()  
+        self.io_settings = self._get_optimal_io_settings()
+        self.stash_base_dir = self._get_stash_directory()
         
         # Enhanced threading for large files  
-        self.new_data_queue: queue.Queue[Optional[bytes]] = queue.Queue(  
-            maxsize=max(2, min(4, self.large_file_config.chunk_size_mb // 8))  # Very small queue  
+        self.new_data_queue: queue.Queue[Optional[bytes]] = queue.Queue(
+            maxsize=max(2, min(4, self.large_file_config.chunk_size_mb // 8))
         )
-        self.new_data_producer_thread: Optional[threading.Thread] = None  
-        self.new_data_producer_running = threading.Event()  
-        self.new_data_condition = threading.Condition()  
+        self.new_data_producer_thread: Optional[threading.Thread] = None
+        self.new_data_producer_running = threading.Event()
+        self.new_data_condition = threading.Condition()
         
         # Progress tracking with memory monitoring  
-        self._last_progress_time = time.time()  
-        self._last_gc_time = time.time()  
-        self.patch_stream_empty = False  
+        self._last_progress_time = time.time()
+        self._last_gc_time = time.time()
+        self.patch_stream_empty = False
         
         # Error handling  
-        self.continue_on_error = continue_on_error  
+        self.continue_on_error = continue_on_error
         self.failed_command_details = {}
+
 
     def _configure_large_file_handling(self) -> LargeFileConfig:  
         """Configure for extreme memory constraints (2GB RAM, 4-15GB files)"""  
@@ -569,169 +569,145 @@ class BlockImageUpdate:
             logger.info("Note: Block device access may require administrator/root privileges")  
             raise  
       
-    def _new_data_producer(self):  
-        """Optimized producer thread with better buffering and error recovery"""  
-        logger.info("New data producer thread starting")  
-        buffer_size = self.BLOCKSIZE * 10  
-        
-        try:  
-            while self.new_data_producer_running.is_set():  
-                try:  
-                    # Check if file descriptor is still valid  
-                    if not self.new_data_fd or self.new_data_fd.closed:  
-                        logger.error("New data file descriptor is closed")  
-                        break  
-                    
-                    data = self.new_data_fd.read(buffer_size)  
-                    if not data:  
-                        self.new_data_queue.put(None)  # EOF signal  
-                        break  
-                    
-                    # Split into individual blocks  
-                    for i in range(0, len(data), self.BLOCKSIZE):  
-                        if not self.new_data_producer_running.is_set():  
-                            break  
-                        
-                        block = data[i:i + self.BLOCKSIZE]  
-                        if len(block) < self.BLOCKSIZE:  
-                            block = block.ljust(self.BLOCKSIZE, b'\x00')  
-                        
-                        # Use timeout to avoid blocking indefinitely  
-                        try:  
-                            self.new_data_queue.put(block, timeout=5)  
-                        except queue.Full:  
-                            logger.warning("New data queue is full, producer may be blocked")  
-                            continue  
-                        
-                        with self.new_data_condition:  
-                            self.new_data_condition.notify_all()  
-                    
-                except (IOError, OSError) as e:  
-                    logger.error(f"Producer I/O error: {e}")  
-                    break  
-                except Exception as e:  
-                    logger.error(f"Producer unexpected error: {e}")  
-                    break  
-                    
-        except Exception as e:  
-            logger.error(f"Producer fatal error: {e}")  
-        finally:  
-            # Signal EOF and cleanup  
-            try:  
-                self.new_data_queue.put(None)  
-            except:  
-                pass  
-            logger.info("New data producer thread terminating")  
+    def _new_data_producer(self):
+        """Producer thread: always open/close file locally, never use global self.new_data_fd"""
+        logger.info("New data producer thread starting")
+        buffer_size = self.BLOCKSIZE * 10
+
+        try:
+            with self.new_data_lock:
+                try:
+                    with open(self.new_data_path, 'rb') as f:
+                        while self.new_data_producer_running.is_set():
+                            data = f.read(buffer_size)
+                            if not data:
+                                self.new_data_queue.put(None)  # EOF signal
+                                break
+
+                            # Split into individual blocks
+                            for i in range(0, len(data), self.BLOCKSIZE):
+                                if not self.new_data_producer_running.is_set():
+                                    break
+
+                                block = data[i:i + self.BLOCKSIZE]
+                                if len(block) < self.BLOCKSIZE:
+                                    block = block.ljust(self.BLOCKSIZE, b'\x00')
+
+                                # Use timeout to avoid blocking indefinitely
+                                try:
+                                    self.new_data_queue.put(block, timeout=5)
+                                except queue.Full:
+                                    logger.warning("New data queue is full, producer may be blocked")
+                                    continue
+
+                                with self.new_data_condition:
+                                    self.new_data_condition.notify_all()
+                except (IOError, OSError) as e:
+                    logger.error(f"Producer I/O error: {e}")
+                except Exception as e:
+                    logger.error(f"Producer unexpected error: {e}")
+        except Exception as e:
+            logger.error(f"Producer fatal error: {e}")
+        finally:
+            # Signal EOF and cleanup
+            try:
+                self.new_data_queue.put(None)
+            except:
+                pass
+            logger.info("New data producer thread terminating")
+
     
-    def _restart_producer_thread(self) -> bool:    
-        """Thread-safe restart of the producer thread"""    
-        try:    
-            # Stop existing thread if running    
-            if self.new_data_producer_thread and self.new_data_producer_thread.is_alive():    
-                self.new_data_producer_running.clear()    
-                self.new_data_producer_thread.join(timeout=2)    
-            
-            # 使用锁保护文件状态检查  
-            with self.new_data_lock:  
-                # Check if new data file is still valid    
-                if not self.new_data_fd or self.new_data_fd.closed:    
-                    logger.error("New data file descriptor is not available for restart")    
-                    return False    
-                
-                # 保持当前文件位置，不要重置    
-                try:    
-                    current_pos = self.new_data_fd.tell()    
-                    self.new_data_fd.seek(0, 2)    
-                    file_size = self.new_data_fd.tell()    
-                    self.new_data_fd.seek(current_pos)    
-                    
-                    logger.info(f"Restarting producer at position: {current_pos}/{file_size}")    
-                    
-                    if current_pos >= file_size:    
-                        logger.info("At end of file, producer may not need restart")    
-                        return True  # 不是错误，只是到了文件末尾    
-                        
-                except Exception as e:    
-                    logger.error(f"Cannot determine file position: {e}")    
-                    return False    
-            
-            # Restart the thread    
-            self.new_data_producer_running.set()    
-            self.new_data_producer_thread = threading.Thread(    
-                target=self._new_data_producer,    
-                daemon=True    
-            )    
-            self.new_data_producer_thread.start()    
-            
-            # Verify thread started    
-            time.sleep(0.1)    
-            is_alive = self.new_data_producer_thread.is_alive()    
-            
-            if not is_alive:    
-                logger.error("Producer thread failed to start or died immediately")    
-            
-            return is_alive    
-            
-        except Exception as e:    
-            logger.error(f"Failed to restart producer thread: {e}")    
+    def _restart_producer_thread(self) -> bool:
+        """Restart producer thread, don't depend on global file descriptor."""
+        try:
+            # Stop existing thread if running
+            if self.new_data_producer_thread and self.new_data_producer_thread.is_alive():
+                self.new_data_producer_running.clear()
+                self.new_data_producer_thread.join(timeout=2)
+
+            # No need to check self.new_data_fd, just verify file exists
+            with self.new_data_lock:
+                if not self.new_data_path.exists():
+                    logger.error("New data file is not available for restart")
+                    return False
+
+                try:
+                    file_size = self.new_data_path.stat().st_size
+                    logger.info(f"Restarting producer, file size: {file_size}")
+                    if file_size == 0:
+                        logger.info("New data file is empty, producer may not need restart")
+                        return True
+
+                except Exception as e:
+                    logger.error(f"Cannot determine file size: {e}")
+                    return False
+
+            # Restart the thread
+            self.new_data_producer_running.set()
+            self.new_data_producer_thread = threading.Thread(
+                target=self._new_data_producer,
+                daemon=True
+            )
+            self.new_data_producer_thread.start()
+            time.sleep(0.1)
+            is_alive = self.new_data_producer_thread.is_alive()
+
+            if not is_alive:
+                logger.error("Producer thread failed to start or died immediately")
+
+            return is_alive
+
+        except Exception as e:
+            logger.error(f"Failed to restart producer thread: {e}")
             return False
 
       
-    def __enter__(self) -> Self:    
-        """Enhanced context manager entry"""    
-        logger.info("Initializing BlockImageUpdate")    
+    def __enter__(self):
+        """Enhanced context manager entry (Windows-safe, no global fd/mmap for big files)"""
+        logger.info("Initializing BlockImageUpdate")
+        
+        if os.name == 'nt':
+            logger.warning("Running on Windows - some operations may require administrator privileges")
+        
+        # Patch stream check
+        if self.patch_data_path.exists() and self.patch_data_path.stat().st_size == 0:
+            self.patch_stream_empty = True
+            logger.info("Patch stream is empty, will skip erase and zero commands")
+            self._create_empty_block_device_file()
+        
+        try:
+            # Create stash directory and set up cache
+            self.stash_base_dir.mkdir(parents=True, exist_ok=True)
+            self.stash_cache.set_disk_cache_dir(self.stash_base_dir)
             
-        # Platform-specific warnings    
-        if os.name == 'nt':    
-            logger.warning("Running on Windows - some operations may require administrator privileges")    
-            
-        # Check patch stream    
-        if self.patch_data_path.exists() and self.patch_data_path.stat().st_size == 0:    
-            self.patch_stream_empty = True    
-            logger.info("Patch stream is empty, will skip erase and zero commands")    
-            self._create_empty_block_device_file()    
-            
-        try:    
-            # Create stash directory and set up cache  
-            self.stash_base_dir.mkdir(parents=True, exist_ok=True)    
-            self.stash_cache.set_disk_cache_dir(self.stash_base_dir)  
-            
-            # Open new data file with memory mapping if possible    
-            if self.new_data_path.exists():    
-                logger.info(f"Opening new data file: {self.new_data_path}")    
-                self.new_data_fd = self.new_data_path.open('rb')    
-                logger.info(f"New data file size: {self.new_data_path.stat().st_size} bytes")    
-                    
-                # Start producer thread    
-                self.new_data_producer_running.set()    
-                self.new_data_producer_thread = threading.Thread(    
-                    target=self._new_data_producer,    
-                    daemon=True    
-                )    
-                self.new_data_producer_thread.start()    
-                    
-                # Verify thread started    
-                time.sleep(0.1)    
-                if not self.new_data_producer_thread.is_alive():    
-                    raise RuntimeError("Failed to start new data producer thread")    
-                logger.info("New data producer thread started successfully")    
+            # Producer thread for new_data file (no global fd!)
+            if self.new_data_path.exists():
+                logger.info(f"Opening new data file: {self.new_data_path}")
+                self.new_data_file_size = self.new_data_path.stat().st_size
+                logger.info(f"New data file size: {self.new_data_file_size} bytes")
                 
-            # Open patch data with memory mapping for better performance    
-            if self.patch_data_path.exists():    
-                self.patch_data_fd = self.patch_data_path.open('rb')    
-                try:    
-                    self.patch_data_mmap = mmap.mmap(    
-                        self.patch_data_fd.fileno(), 0, access=mmap.ACCESS_READ    
-                    )    
-                    logger.info("Patch data memory-mapped successfully")    
-                except (OSError, ValueError):    
-                    logger.warning("Failed to memory-map patch data, using regular file I/O")    
-                
-        except Exception as e:    
-            logger.error(f"Failed to initialize: {e}")    
-            raise    
+                self.new_data_producer_running.set()
+                self.new_data_producer_thread = threading.Thread(
+                    target=self._new_data_producer,
+                    daemon=True
+                )
+                self.new_data_producer_thread.start()
+                time.sleep(0.1)
+                if not self.new_data_producer_thread.is_alive():
+                    raise RuntimeError("Failed to start new data producer thread")
+                logger.info("New data producer thread started successfully")
             
+            # Patch data mmap/FD: REMOVE all global fd/mmap usage!
+            # If you need to mmap for small patch files (under 100M), do it in the function, not here!
+            # For big patch.dat: always use open/close per access (see _read_patch_bytes).
+            # If you want to keep a flag, just remember patch file exists and its path.
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize: {e}")
+            raise
+        
         return self
+
 
   
     def _create_empty_block_device_file(self):  
@@ -893,43 +869,6 @@ class BlockImageUpdate:
             logger.error(f"Failed to write new data: {e}")  
             self._update_performance_stats('error', error_type='new_command_failed')  
             return -1
-
-
-
-  
-    def perform_command_move(self, tokens: List[str], pos: int) -> int:  
-        """Move data between block ranges with proper version handling"""  
-        try:  
-            if self.version == 1:  
-                tgt_rangeset, src_data, _ = self._load_src_tgt_version1(tokens, pos)  
-            elif self.version == 2:  
-                tgt_rangeset, src_data, _, _ = self._load_src_tgt_version2(tokens, pos)  
-            else:  
-                tgt_rangeset, src_data, _, _ = self._load_src_tgt_version3(tokens, pos, onehash=True)  
-        except Exception as e:  
-            logger.error(f"Failed to parse move command: {e}")  
-            return -1  
-  
-        # Trim src_data to target size  
-        expected_size = tgt_rangeset.size * self.BLOCKSIZE  
-        if len(src_data) < expected_size:  
-            logger.error(f"Source data too short: src={len(src_data)}, tgt={expected_size}")  
-            return -1  
-        elif len(src_data) > expected_size:  
-            logger.warning(f"Source data too long, trimming: src={len(src_data)}, tgt={expected_size}")  
-            src_data = src_data[:expected_size]  
-  
-        logger.info(f"Moving {tgt_rangeset.size} blocks")  
-          
-        try:  
-            if not self._write_blocks(tgt_rangeset, src_data):  
-                return -1  
-            self.written += tgt_rangeset.size  
-            return 0  
-        except Exception as e:  
-            logger.error(f"Failed to move blocks: {e}")  
-            return -1  
-  
   
     def perform_command_diff(self, tokens: List[str], pos: int, cmd_name: str) -> int:
         """Apply diff patches safely for large patch.dat on Windows (no global fd/mmap)"""
@@ -942,13 +881,7 @@ class BlockImageUpdate:
             length = int(tokens[pos + 1])
             pos += 2
 
-            # 安全读取patch片段（避免全局fd/mmap，兼容大文件和Windows）
-            def read_patch_bytes(path, offset, length):
-                with open(path, 'rb') as fd:
-                    fd.seek(offset)
-                    return fd.read(length)
-
-            patch_data = read_patch_bytes(self.patch_data_path, offset, length)
+            patch_data = self._read_patch_bytes(self.patch_data_path, offset, length)
 
             # Parse based on transfer list version
             if self.version >= 3:
@@ -964,7 +897,6 @@ class BlockImageUpdate:
 
                 tgt_rangeset = RangeSet(tgt_range)
 
-                # Load source data using version 3 loader
                 try:
                     _, src_data, _, _ = self._load_src_tgt_version3(tokens, pos - 4, onehash=False)
                 except Exception as e:
@@ -972,7 +904,6 @@ class BlockImageUpdate:
                     return -1
 
             else:
-                # Version 1/2 handling
                 if pos + 1 >= len(tokens):
                     logger.error("Missing target/source ranges for version 1/2 diff")
                     return -1
@@ -991,7 +922,6 @@ class BlockImageUpdate:
             if result is None:
                 return -1
 
-            # Write result using RangeSink with proper block alignment
             if not self._write_blocks(tgt_rangeset, result):
                 logger.error("Failed to write patched blocks")
                 return -1
@@ -1003,78 +933,58 @@ class BlockImageUpdate:
             logger.error(f"Failed to apply {cmd_name} patch: {e}")
             return -1
 
+    def perform_command_move(self, tokens: List[str], pos: int, cmd_name: str) -> int:
+        """Safely move blocks without global fd usage."""
+        if pos + 1 >= len(tokens):
+            logger.error("Missing target/source ranges for move")
+            return -1
 
+        try:
+            tgt_rangeset = RangeSet(tokens[pos])
+            src_rangeset = RangeSet(tokens[pos + 1])
+            pos += 2
 
-    def _new_data_producer(self):    
-        """Thread-safe producer thread with file access synchronization"""    
-        logger.info("New data producer thread starting")    
-        buffer_size = self.BLOCKSIZE * 10    
-        
-        try:    
-            while self.new_data_producer_running.is_set():    
-                try:    
-                    # 使用锁保护文件访问  
-                    with self.new_data_lock:  
-                        # Check if file descriptor is still valid    
-                        if not self.new_data_fd or self.new_data_fd.closed:    
-                            logger.error("New data file descriptor is closed")    
-                            break    
-                        
-                        # Check current position and file size    
-                        current_pos = self.new_data_fd.tell()    
-                        self.new_data_fd.seek(0, 2)  # Seek to end    
-                        file_size = self.new_data_fd.tell()    
-                        self.new_data_fd.seek(current_pos)  # Restore position    
-                        
-                        if current_pos >= file_size:    
-                            logger.info("Reached end of new data file")    
-                            self.new_data_queue.put(None)  # EOF signal    
-                            break    
-                        
-                        # 读取数据时保持锁定  
-                        data = self.new_data_fd.read(buffer_size)    
-                        if not data:    
-                            logger.info("No more data available, sending EOF signal")    
-                            self.new_data_queue.put(None)  # EOF signal    
-                            break    
-                    
-                    # 在锁外处理数据，避免长时间持有锁  
-                    # Split into individual blocks    
-                    for i in range(0, len(data), self.BLOCKSIZE):    
-                        if not self.new_data_producer_running.is_set():    
-                            break    
-                        
-                        block = data[i:i + self.BLOCKSIZE]    
-                        if len(block) < self.BLOCKSIZE:    
-                            block = block.ljust(self.BLOCKSIZE, b'\x00')    
-                        
-                        # Use timeout to avoid blocking indefinitely    
-                        try:    
-                            self.new_data_queue.put(block, timeout=5)    
-                        except queue.Full:    
-                            logger.warning("New data queue is full, producer may be blocked")    
-                            continue    
-                        
-                        with self.new_data_condition:    
-                            self.new_data_condition.notify_all()    
-                    
-                except (IOError, OSError) as e:    
-                    logger.error(f"Producer I/O error: {e}")    
-                    break    
-                except Exception as e:    
-                    logger.error(f"Producer unexpected error: {e}")    
-                    break    
-                    
-        except Exception as e:    
-            logger.error(f"Producer fatal error: {e}")    
-        finally:    
-            # Signal EOF and cleanup    
-            try:    
-                self.new_data_queue.put(None)    
-            except:    
-                pass    
-            logger.info("New data producer thread terminating")
+            src_data = self._read_blocks(src_rangeset)
+            if src_data is None:
+                logger.error("Failed to read source blocks for move")
+                return -1
 
+            if not self._write_blocks(tgt_rangeset, src_data):
+                logger.error("Failed to write moved blocks")
+                return -1
+
+            self.written += tgt_rangeset.size
+            return 0
+
+        except Exception as e:
+            logger.error(f"Failed to apply move command: {e}")
+            return -1
+
+    def _read_patch_bytes(self, path, offset, length):
+        """Read a slice of patch.dat in a safe, Windows-friendly way."""
+        with open(path, 'rb') as fd:
+            fd.seek(offset)
+            return fd.read(length)
+
+    def _read_blocks(self, rangeset):
+        """Read blocks from the image file in a safe, Windows-friendly way."""
+        data = bytearray()
+        for start, end in rangeset:
+            with open(self.image_path, 'rb') as f:
+                f.seek(start * self.block_size)
+                data += f.read((end - start) * self.block_size)
+        return bytes(data)
+
+    def _write_blocks(self, rangeset, data):
+        """Write blocks to the image file in a safe, Windows-friendly way."""
+        data_offset = 0
+        for start, end in rangeset:
+            length = (end - start) * self.block_size
+            with open(self.image_path, 'r+b') as f:
+                f.seek(start * self.block_size)
+                f.write(data[data_offset:data_offset+length])
+            data_offset += length
+        return True
   
     def _apply_patch_internal(self, src_data: bytes, patch_data: bytes,     
                             cmd_name: str, expected_tgt_hash: str) -> Optional[bytes]:    
@@ -2583,56 +2493,39 @@ class BlockImageUpdate:
         
         return recommendations  
 
-    def __exit__(self, exc_type, exc_val, exc_tb):  
-        """Enhanced cleanup with proper resource management and cache cleanup"""  
-        logger.info("Cleaning up BlockImageUpdate resources")  
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Enhanced cleanup with proper resource management and cache cleanup"""
+        logger.info("Cleaning up BlockImageUpdate resources")
         
-        # Stop producer thread  
-        if self.new_data_producer_thread and self.new_data_producer_thread.is_alive():  
-            self.new_data_producer_running.clear()  
-            with self.new_data_condition:  
-                self.new_data_condition.notify_all()  
-            self.new_data_producer_thread.join(timeout=5)  
+        # Stop producer thread
+        if hasattr(self, "new_data_producer_thread") and self.new_data_producer_thread and self.new_data_producer_thread.is_alive():
+            self.new_data_producer_running.clear()
+            if hasattr(self, "new_data_condition"):
+                with self.new_data_condition:
+                    self.new_data_condition.notify_all()
+            self.new_data_producer_thread.join(timeout=5)
         
-        # Close file descriptors and memory maps with specific error handling  
-        if self.patch_data_mmap:  
-            try:  
-                self.patch_data_mmap.close()  
-                self.patch_data_mmap = None  
-            except Exception as e:  
-                logger.warning(f"Failed to close patch data mmap: {e}")  
+        # NO global patch_data_fd/patch_data_mmap/new_data_fd to close!
+        # If you have any, REMOVE them!
         
-        if self.new_data_fd:  
-            try:  
-                self.new_data_fd.close()  
-                self.new_data_fd = None  
-            except Exception as e:  
-                logger.warning(f"Failed to close new data file: {e}")  
+        # Clean up progress checkpoint on normal completion
+        if exc_type is None:
+            self._cleanup_progress_checkpoint()
         
-        if self.patch_data_fd:  
-            try:  
-                self.patch_data_fd.close()  
-                self.patch_data_fd = None  
-            except Exception as e:  
-                logger.warning(f"Failed to close patch data file: {e}")  
+        # Cleanup stash (now includes LRU cache cleanup)
+        self._cleanup_stash()
         
-        # Clean up progress checkpoint on normal completion  
-        if exc_type is None:  
-            self._cleanup_progress_checkpoint()  
-        
-        # Cleanup stash (now includes LRU cache cleanup)  
-        self._cleanup_stash()  
-        
-        # Clear queue  
-        try:  
-            while not self.new_data_queue.empty():  
-                try:  
-                    self.new_data_queue.get_nowait()  
-                    self.new_data_queue.task_done()  
-                except queue.Empty:  
-                    break  
-        except Exception as e:  
-            logger.warning(f"Failed to clear queue: {e}")
+        # Clear queue
+        if hasattr(self, "new_data_queue"):
+            try:
+                while not self.new_data_queue.empty():
+                    try:
+                        self.new_data_queue.get_nowait()
+                        self.new_data_queue.task_done()
+                    except queue.Empty:
+                        break
+            except Exception as e:
+                logger.warning(f"Failed to clear queue: {e}")
   
 
     def _log_performance_summary(self):  
