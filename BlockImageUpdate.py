@@ -425,55 +425,58 @@ class BlockImageUpdate:
       
     BLOCKSIZE = 4096  
       
-    def __init__(self, blockdev_path: str, transfer_list_path: str, new_data_path: str, patch_data_path: str, continue_on_error: bool = False):
-        self.blockdev_path = Path(blockdev_path)
-        self.transfer_list_path = Path(transfer_list_path)
-        self.new_data_path = Path(new_data_path)
-        self.patch_data_path = Path(patch_data_path)
+    def __init__(self, blockdev_path: str, transfer_list_path: str, new_data_path: str, patch_data_path: str, continue_on_error: bool = False):  
+        self.blockdev_path = Path(blockdev_path)  
+        self.transfer_list_path = Path(transfer_list_path)  
+        self.new_data_path = Path(new_data_path)  
+        self.patch_data_path = Path(patch_data_path)  
         
         # 检测文件大小并配置处理策略  
-        self.large_file_config = self._configure_large_file_handling()
+        self.large_file_config = self._configure_large_file_handling()  
         
         # Core state  
-        self.stash_cache = LRUStashCache(
-            max_items=5 if self.large_file_config.enable_streaming else 10,
-            max_memory_mb=min(64, self.large_file_config.memory_limit_mb // 4)
+        self.stash_cache = LRUStashCache(  
+            max_items=5 if self.large_file_config.enable_streaming else 10,  # Much smaller cache  
+            max_memory_mb=min(64, self.large_file_config.memory_limit_mb // 4)  # Very limited memory  
         )
-        self.written = 0
-        self.version = 1
-        self.total_blocks = 0
-        self.transfer_lines: List[str] = []
+        self.written = 0  
+        self.version = 1  
+        self.total_blocks = 0  
+        self.transfer_lines: List[str] = []  
         
-        # REMOVE all global file descriptors!
+        # REMOVE: File descriptors with streaming support  
+        # self.new_data_fd: Optional[BinaryIO] = None  
+        # self.patch_data_fd: Optional[BinaryIO] = None  
+        # self.patch_data_mmap: Optional[mmap.mmap] = None  
         
         # 添加文件访问锁和流式处理状态  
-        self.new_data_lock = threading.RLock()
-        self.patch_data_lock = threading.RLock()
-        self.streaming_state = {
-            'current_chunk': 0,
-            'total_chunks': 0,
-            'memory_usage': 0
-        }
+        self.new_data_lock = threading.RLock()  
+        self.patch_data_lock = threading.RLock()  
+        self.streaming_state = {  
+            'current_chunk': 0,  
+            'total_chunks': 0,  
+            'memory_usage': 0  
+        }  
         
         # Platform-specific setup  
-        self.io_settings = self._get_optimal_io_settings()
-        self.stash_base_dir = self._get_stash_directory()
+        self.io_settings = self._get_optimal_io_settings()  
+        self.stash_base_dir = self._get_stash_directory()  
         
         # Enhanced threading for large files  
-        self.new_data_queue: queue.Queue[Optional[bytes]] = queue.Queue(
-            maxsize=max(2, min(4, self.large_file_config.chunk_size_mb // 8))
+        self.new_data_queue: queue.Queue[Optional[bytes]] = queue.Queue(  
+            maxsize=max(2, min(4, self.large_file_config.chunk_size_mb // 8))  # Very small queue  
         )
-        self.new_data_producer_thread: Optional[threading.Thread] = None
-        self.new_data_producer_running = threading.Event()
-        self.new_data_condition = threading.Condition()
+        self.new_data_producer_thread: Optional[threading.Thread] = None  
+        self.new_data_producer_running = threading.Event()  
+        self.new_data_condition = threading.Condition()  
         
         # Progress tracking with memory monitoring  
-        self._last_progress_time = time.time()
-        self._last_gc_time = time.time()
-        self.patch_stream_empty = False
+        self._last_progress_time = time.time()  
+        self._last_gc_time = time.time()  
+        self.patch_stream_empty = False  
         
         # Error handling  
-        self.continue_on_error = continue_on_error
+        self.continue_on_error = continue_on_error  
         self.failed_command_details = {}
 
 
@@ -615,7 +618,6 @@ class BlockImageUpdate:
             except:
                 pass
             logger.info("New data producer thread terminating")
-
     
     def _restart_producer_thread(self) -> bool:
         """Restart producer thread, don't depend on global file descriptor."""
