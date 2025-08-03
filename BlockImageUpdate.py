@@ -29,23 +29,52 @@ import gc      # 垃圾回收控制
 
 logger = logging.getLogger("BlockImageUpdate")
 
-def safe_mmap(fd, length, access=mmap.ACCESS_READ):
-    try:
-        mm = mmap.mmap(fd.fileno(), length, access=access)
-        data = mm[:]
-        mm.close()
-        return data
-    except Exception as e:
-        print(f"mmap failed, fallback to read: {e}")
-        fd.seek(0)
-        return fd.read(length)
-
 def read_bin_file(filename):
     with open(filename, 'rb') as f:
         return f.read()
-def write_bin_file(filename, data):
-    with open(filename, 'wb') as f:
-        f.write(data)
+    
+def write_bin_file(filename, data):  
+    """Windows-safe file writing with WinError 6 handling"""  
+    filename = Path(filename)  
+    filename.parent.mkdir(parents=True, exist_ok=True)  
+      
+    if os.name == 'nt':  
+        # Windows-specific atomic write with retry logic  
+        max_retries = 3  
+        for attempt in range(max_retries):  
+            temp_file = filename.with_suffix(f'.tmp_{os.getpid()}_{attempt}')  
+            try:  
+                with open(temp_file, 'wb') as f:  
+                    f.write(data)  
+                    f.flush()  
+                    os.fsync(f.fileno())  
+                  
+                # Atomic rename on Windows  
+                if filename.exists():  
+                    try:  
+                        filename.unlink()  
+                    except (PermissionError, OSError):  
+                        time.sleep(0.1)  
+                        filename.unlink()  
+                temp_file.rename(filename)  
+                break  # Success  
+                  
+            except OSError as e:  
+                if temp_file.exists():  
+                    try:  
+                        temp_file.unlink()  
+                    except:  
+                        pass  
+                          
+                if hasattr(e, 'winerror') and e.winerror == 6:  
+                    logger.warning(f"WinError 6 in write_bin_file, attempt {attempt + 1}")  
+                    if attempt < max_retries - 1:  
+                        time.sleep(0.2 * (attempt + 1))  
+                        continue  
+                raise e  
+    else:  
+        with open(filename, 'wb') as f:  
+            f.write(data)
 
 def ensure_bytes(data):
     if isinstance(data, (bytes, bytearray)):
@@ -56,11 +85,6 @@ def ensure_bytes(data):
         return bytes(data)
     else:
         raise TypeError(f"Unsupported data type for patch: {type(data)}")
-
-def read_patch_bytes(path, offset, length):
-    with open(path, 'rb') as fd:
-        fd.seek(offset)
-        return fd.read(length)
         
     
 @dataclass  
@@ -430,7 +454,10 @@ class BlockImageUpdate:
         self.transfer_list_path = Path(transfer_list_path)  
         self.new_data_path = Path(new_data_path)  
         self.patch_data_path = Path(patch_data_path)  
-        
+        self.image_path = self.blockdev_path
+        self.block_size = self.BLOCKSIZE
+        self.new_data_queue = queue.Queue(maxsize=20)
+
         # 检测文件大小并配置处理策略  
         self.large_file_config = self._configure_large_file_handling()  
         
@@ -550,74 +577,118 @@ class BlockImageUpdate:
         else:  
             return Path('/tmp/biu_cache')  
       
-    @contextmanager  
-    def _open_block_device(self, mode='rb'):  
-        """Context manager for opening block device with proper error handling"""  
-        try:  
+    @contextmanager    
+    def _open_block_device(self, mode='rb'):    
+        """Context manager for opening block device with Windows WinError 6 handling"""    
+        fd = None  
+        try:    
+            if os.name == 'nt':    
+                # Windows-specific file handling with WinError 6 protection  
+                max_retries = 3  
+                for attempt in range(max_retries):  
+                    try:  
+                        fd = open(self.blockdev_path, mode)  
+                        break  # Success  
+                    except OSError as e:  
+                        if hasattr(e, 'winerror') and e.winerror == 6:  # ERROR_INVALID_HANDLE  
+                            logger.warning(f"WinError 6 on attempt {attempt + 1}, retrying...")  
+                            if attempt < max_retries - 1:  
+                                time.sleep(0.2 * (attempt + 1))  # Progressive delay  
+                                continue  
+                        raise  
+            else:    
+                fd = open(self.blockdev_path, mode)    
+                
+            yield fd    
+                
+        except PermissionError:    
+            logger.error(f"Permission denied accessing {self.blockdev_path}")    
             if os.name == 'nt':  
-                if self.blockdev_path.as_posix().startswith('\\\\.\\'):  
-                    fd = self.blockdev_path.open(mode, buffering=0)  
-                else:  
-                    fd = self.blockdev_path.open(mode)  
-            else:  
-                fd = self.blockdev_path.open(mode)  
-              
-            try:  
-                yield fd  
-            finally:  
-                fd.close()  
-                  
-        except PermissionError:  
-            logger.error(f"Permission denied accessing {self.blockdev_path}")  
-            logger.info("Note: Block device access may require administrator/root privileges")  
-            raise  
+                logger.info("Note: On Windows, you may need to run as Administrator")  
+            raise    
+        finally:    
+            if fd is not None:  
+                try:  
+                    fd.close()  
+                except (OSError, ValueError):  
+                    pass  # Ignore close errors on invalid handles
+
       
-    def _new_data_producer(self):
-        """Producer thread: always open/close file locally, never use global self.new_data_fd"""
-        logger.info("New data producer thread starting")
-        buffer_size = self.BLOCKSIZE * 10
-
-        try:
-            with self.new_data_lock:
-                try:
-                    with open(self.new_data_path, 'rb') as f:
-                        while self.new_data_producer_running.is_set():
-                            data = f.read(buffer_size)
-                            if not data:
-                                self.new_data_queue.put(None)  # EOF signal
-                                break
-
-                            # Split into individual blocks
-                            for i in range(0, len(data), self.BLOCKSIZE):
-                                if not self.new_data_producer_running.is_set():
-                                    break
-
-                                block = data[i:i + self.BLOCKSIZE]
-                                if len(block) < self.BLOCKSIZE:
-                                    block = block.ljust(self.BLOCKSIZE, b'\x00')
-
-                                # Use timeout to avoid blocking indefinitely
-                                try:
-                                    self.new_data_queue.put(block, timeout=5)
-                                except queue.Full:
-                                    logger.warning("New data queue is full, producer may be blocked")
-                                    continue
-
-                                with self.new_data_condition:
-                                    self.new_data_condition.notify_all()
-                except (IOError, OSError) as e:
-                    logger.error(f"Producer I/O error: {e}")
-                except Exception as e:
-                    logger.error(f"Producer unexpected error: {e}")
-        except Exception as e:
-            logger.error(f"Producer fatal error: {e}")
-        finally:
-            # Signal EOF and cleanup
-            try:
-                self.new_data_queue.put(None)
-            except:
-                pass
+    def _new_data_producer(self):  
+        """Producer thread with queue overflow handling"""  
+        logger.info("New data producer thread starting")  
+        buffer_size = self.BLOCKSIZE * 5  # 减小缓冲区以避免队列溢出  
+    
+        try:  
+            with self.new_data_lock:  
+                max_retries = 3  
+                for attempt in range(max_retries):  
+                    fd = None  
+                    try:  
+                        fd = open(self.new_data_path, 'rb')  
+                        while self.new_data_producer_running.is_set():  
+                            data = fd.read(buffer_size)  
+                            if not data:  
+                                self.new_data_queue.put(None)  # EOF signal  
+                                break  
+    
+                            # Split into individual blocks  
+                            for i in range(0, len(data), self.BLOCKSIZE):  
+                                if not self.new_data_producer_running.is_set():  
+                                    break  
+    
+                                block = data[i:i + self.BLOCKSIZE]  
+                                if len(block) < self.BLOCKSIZE:  
+                                    block = block.ljust(self.BLOCKSIZE, b'\x00')  
+    
+                                # 增加超时时间并处理队列满的情况  
+                                try:  
+                                    self.new_data_queue.put(block, timeout=10)  
+                                except queue.Full:  
+                                    logger.warning("New data queue is full, waiting...")  
+                                    # 等待队列有空间，避免数据丢失  
+                                    time.sleep(0.1)  
+                                    try:  
+                                        self.new_data_queue.put(block, timeout=30)  
+                                    except queue.Full:  
+                                        logger.error("Queue remained full, may cause data corruption")  
+                                        continue  
+    
+                                with self.new_data_condition:  
+                                    self.new_data_condition.notify_all()  
+                        break  # Success, exit retry loop  
+                        
+                    except OSError as e:  
+                        if fd is not None:  
+                            try:  
+                                fd.close()  
+                            except:  
+                                pass  
+                            fd = None  
+                            
+                        if os.name == 'nt' and hasattr(e, 'winerror') and e.winerror == 6:  
+                            logger.warning(f"WinError 6 in producer thread, attempt {attempt + 1}")  
+                            if attempt < max_retries - 1:  
+                                time.sleep(0.5 * (attempt + 1))  
+                                continue  
+                        raise  
+                    finally:  
+                        if fd is not None:  
+                            try:  
+                                fd.close()  
+                            except:  
+                                pass  
+                        
+        except Exception as e:  
+            logger.error(f"Producer fatal error: {e}")  
+        finally:  
+            try:  
+                self.new_data_queue.put(None)  
+            except:  
+                pass  
             logger.info("New data producer thread terminating")
+
+
     
     def _restart_producer_thread(self) -> bool:
         """Restart producer thread, don't depend on global file descriptor."""
@@ -762,47 +833,46 @@ class BlockImageUpdate:
         except Exception as e:  
             logger.warning(f"Failed to cleanup progress checkpoint: {e}")  
   
-    def perform_command_zero(self, tokens: List[str], pos: int) -> int:  
-        """Zero out specified block ranges with enhanced error handling"""  
-        if pos >= len(tokens):  
-            logger.error("Missing target blocks for zero")  
-            return -1  
-              
+    def perform_command_zero(self, tokens: List[str]) -> int:  
+        """执行zero命令，将指定块范围填充为零"""  
         try:  
-            rangeset = RangeSet(tokens[pos])  
-            logger.info(f"Zeroing {rangeset.size} blocks")  
-              
-            zero_block = b'\x00' * self.BLOCKSIZE  
-              
+            if len(tokens) < 2:  
+                logger.error("missing target blocks for zero")  
+                return -1  
+            
+            # 解析目标范围 - 直接使用 tokens[1]，因为 tokens[0] 是命令名  
+            target_range = RangeSet(tokens[1])  
+            total_blocks = target_range.size  
+            
+            logger.info(f"Zeroing {total_blocks} blocks")  
+            
+            # 创建单个块大小的零缓冲区  
+            BLOCKSIZE = 4096  
+            zero_buffer = bytes(BLOCKSIZE)  # 4096字节的零数据  
+            
+            # 对每个范围中的每个块写入零数据  
             with self._open_block_device('r+b') as f:  
-                for start_block, end_block in rangeset:  
-                    offset = start_block * self.BLOCKSIZE  
-                    f.seek(offset)  
-                      
-                    for block in range(start_block, end_block):  
-                        write_bin_file(zero_block)  
-                      
-                    # Sync based on platform  
-                    if self.io_settings.sync_method == 'fsync':  
-                        os.fsync(f.fileno())  
-                    else:  
-                        f.flush()  
-              
-            self.written += rangeset.size  
+                for start_block, end_block in target_range:  
+                    for block_num in range(start_block, end_block):  
+                        offset = block_num * BLOCKSIZE  
+                        f.seek(offset)  
+                        f.write(zero_buffer)  
+            
+            self.written += total_blocks  
             return 0  
-              
+            
         except Exception as e:  
             logger.error(f"Failed to zero blocks: {e}")  
-            return -1  
-  
-    def perform_command_new(self, tokens: List[str], pos: int) -> int:  
+            return -1
+
+    def perform_command_new(self, tokens: List[str]) -> int:  
         """Write new data with performance monitoring integration"""  
-        if pos >= len(tokens):  
+        if len(tokens) < 2:  
             logger.error("Missing target blocks for new")  
             return -1  
         
         try:  
-            rangeset = RangeSet(tokens[pos])  
+            rangeset = RangeSet(tokens[1])  # 直接使用 tokens[1]  
             logger.info(f"Writing {rangeset.size} blocks of new data")  
             
             # 性能监控：数据处理开始  
@@ -871,96 +941,122 @@ class BlockImageUpdate:
             logger.error(f"Failed to write new data: {e}")  
             self._update_performance_stats('error', error_type='new_command_failed')  
             return -1
-  
-    def perform_command_diff(self, tokens: List[str], pos: int, cmd_name: str) -> int:
-        """Apply diff patches safely for large patch.dat on Windows (no global fd/mmap)"""
-        if pos + 1 >= len(tokens):
-            logger.error(f"Missing patch offset or length for {cmd_name}")
+    def _handle_new_command(self, tokens: List[str], pos: int) -> int:  
+        """Handle new command"""  
+        return self.perform_command_new(tokens)
+
+    def perform_command_diff(self, tokens: List[str], cmd_name: str) -> int:  
+        """Apply diff patches safely for large patch.dat on Windows (no global fd/mmap)"""  
+        if len(tokens) < 3:  
+            logger.error(f"Missing patch offset or length for {cmd_name}")  
+            return -1  
+    
+        try:  
+            pos = 1  # 从 tokens[1] 开始解析  
+            offset = int(tokens[pos])  
+            length = int(tokens[pos + 1])  
+            pos += 2  
+    
+            patch_data = self._read_patch_bytes(self.patch_data_path, offset, length)  
+    
+            # Parse based on transfer list version  
+            if self.version >= 3:  
+                if pos + 4 >= len(tokens):  
+                    logger.error("Missing required parameters for version 3+ diff")  
+                    return -1  
+    
+                src_hash = tokens[pos]  
+                tgt_hash = tokens[pos + 1]  
+                tgt_range = tokens[pos + 2]  
+                src_blocks = int(tokens[pos + 3])  
+                pos += 4  
+    
+                tgt_rangeset = RangeSet(tgt_range)  
+    
+                try:  
+                    _, src_data, _, _ = self._load_src_tgt_version3(tokens, pos - 4, onehash=False)  
+                except Exception as e:  
+                    logger.error(f"Failed to load source data: {e}")  
+                    return -1  
+    
+            else:  
+                if pos + 1 >= len(tokens):  
+                    logger.error("Missing target/source ranges for version 1/2 diff")  
+                    return -1  
+    
+                tgt_rangeset = RangeSet(tokens[pos])  
+                src_rangeset = RangeSet(tokens[pos + 1])  
+                src_data = self._read_blocks(src_rangeset)  
+                tgt_hash = None  
+    
+                if src_data is None:  
+                    logger.error("Failed to read source blocks")  
+                    return -1  
+    
+            patch_data = ensure_bytes(patch_data)  
+            result = self._apply_patch_internal(src_data, patch_data, cmd_name, tgt_hash)  
+            if result is None:  
+                return -1  
+    
+            if not self._write_blocks(tgt_rangeset, result):  
+                logger.error("Failed to write patched blocks")  
+                return -1  
+    
+            self.written += tgt_rangeset.size  
+            return 0  
+    
+        except Exception as e:  
+            logger.error(f"Failed to apply {cmd_name} patch: {e}")  
             return -1
 
-        try:
-            offset = int(tokens[pos])
-            length = int(tokens[pos + 1])
-            pos += 2
-
-            patch_data = self._read_patch_bytes(self.patch_data_path, offset, length)
-
-            # Parse based on transfer list version
-            if self.version >= 3:
-                if pos + 4 >= len(tokens):
-                    logger.error("Missing required parameters for version 3+ diff")
-                    return -1
-
-                src_hash = tokens[pos]
-                tgt_hash = tokens[pos + 1]
-                tgt_range = tokens[pos + 2]
-                src_blocks = int(tokens[pos + 3])
-                pos += 4
-
-                tgt_rangeset = RangeSet(tgt_range)
-
-                try:
-                    _, src_data, _, _ = self._load_src_tgt_version3(tokens, pos - 4, onehash=False)
-                except Exception as e:
-                    logger.error(f"Failed to load source data: {e}")
-                    return -1
-
-            else:
-                if pos + 1 >= len(tokens):
-                    logger.error("Missing target/source ranges for version 1/2 diff")
-                    return -1
-
-                tgt_rangeset = RangeSet(tokens[pos])
-                src_rangeset = RangeSet(tokens[pos + 1])
-                src_data = self._read_blocks(src_rangeset)
-                tgt_hash = None
-
-                if src_data is None:
-                    logger.error("Failed to read source blocks")
-                    return -1
-
-            patch_data = ensure_bytes(patch_data)
-            result = self._apply_patch_internal(src_data, patch_data, cmd_name, tgt_hash)
-            if result is None:
-                return -1
-
-            if not self._write_blocks(tgt_rangeset, result):
-                logger.error("Failed to write patched blocks")
-                return -1
-
-            self.written += tgt_rangeset.size
-            return 0
-
-        except Exception as e:
-            logger.error(f"Failed to apply {cmd_name} patch: {e}")
+        
+    def perform_command_move(self, tokens: List[str]) -> int:  
+        """Move blocks between ranges with corrected version 3+ support"""  
+        if len(tokens) < 2:  
+            logger.error("Missing parameters for move")  
+            return -1  
+        
+        try:  
+            pos = 1  # 从 tokens[1] 开始解析  
+            
+            if self.version >= 3:  
+                # Version 3+ format: move <hash> <tgt_range> <src_block_count> <src_range> [<src_loc>] [<stash_id:stash_range>...]  
+                # 对于move命令，使用onehash=True，因为源和目标哈希相同  
+                try:  
+                    tgt_rangeset, src_data, src_blocks, overlap = self._load_src_tgt_version3(tokens, pos, onehash=True)  
+                except Exception as e:  
+                    logger.error(f"Failed to load source data: {e}")  
+                    return -1  
+                    
+            else:  
+                # Version 1/2 format: move <tgt_range> <src_range>  
+                if pos + 1 >= len(tokens):  
+                    logger.error("Missing target/source ranges for move")  
+                    return -1  
+                    
+                tgt_rangeset = RangeSet(tokens[pos])  
+                src_rangeset = RangeSet(tokens[pos + 1])  
+                src_data = self._read_blocks(src_rangeset)  
+                
+                if src_data is None:  
+                    logger.error("Failed to read source blocks for move")  
+                    return -1  
+    
+            if not self._write_blocks(tgt_rangeset, src_data):  
+                logger.error("Failed to write moved blocks")  
+                return -1  
+    
+            self.written += tgt_rangeset.size  
+            return 0  
+    
+        except Exception as e:  
+            logger.error(f"Failed to apply move command: {e}")  
             return -1
 
-    def perform_command_move(self, tokens: List[str], pos: int, cmd_name: str) -> int:
-        """Safely move blocks without global fd usage."""
-        if pos + 1 >= len(tokens):
-            logger.error("Missing target/source ranges for move")
-            return -1
+    def _handle_move_command(self, tokens: List[str], pos: int) -> int:  
+        """Handle move command"""  
+        return self.perform_command_move(tokens)
 
-        try:
-            tgt_rangeset = RangeSet(tokens[pos])
-            src_rangeset = RangeSet(tokens[pos + 1])
-            pos += 2
-
-            src_data = self._read_blocks(src_rangeset)
-            if src_data is None:
-                logger.error("Failed to read source blocks for move")
-                return -1
-
-            if not self._write_blocks(tgt_rangeset, src_data):
-                logger.error("Failed to write moved blocks")
-                return -1
-
-            self.written += tgt_rangeset.size
-            return 0
-
-        except Exception as e:
-            logger.error(f"Failed to apply move command: {e}")
-            return -1
 
     def _read_patch_bytes(self, path, offset, length):
         """Read a slice of patch.dat in a safe, Windows-friendly way."""
@@ -972,9 +1068,9 @@ class BlockImageUpdate:
         """Read blocks from the image file in a safe, Windows-friendly way."""
         data = bytearray()
         for start, end in rangeset:
-            with open(self.image_path, 'rb') as f:
-                f.seek(start * self.block_size)
-                data += f.read((end - start) * self.block_size)
+            with open(self.blockdev_path, 'rb') as f:
+                f.seek(start * self.BLOCKSIZE)
+                data += f.read((end - start) * self.BLOCKSIZE)
         return bytes(data)
 
     def _write_blocks(self, rangeset, data):
@@ -982,43 +1078,44 @@ class BlockImageUpdate:
         data_offset = 0
         for start, end in rangeset:
             length = (end - start) * self.block_size
-            with open(self.image_path, 'r+b') as f:
-                f.seek(start * self.block_size)
+            with open(self.blockdev_path, 'r+b') as f:
+                f.seek(start * self.BLOCKSIZE)
                 f.write(data[data_offset:data_offset+length])
             data_offset += length
         return True
   
-    def _apply_patch_internal(self, src_data: bytes, patch_data: bytes,     
-                            cmd_name: str, expected_tgt_hash: str) -> Optional[bytes]:    
-        """Apply patch using imported ApplyPatch functions with basic error handling"""    
-        try:
-            src_data = ensure_bytes(src_data)
-            patch_data = ensure_bytes(patch_data)    
-            # 确保 src_data 是 bytes 类型  
-            if isinstance(src_data, bytearray):    
-                src_data = bytes(src_data)    
+    def _apply_patch_internal(self, src_data: bytes, patch_data: bytes,       
+                            cmd_name: str, expected_tgt_hash: str) -> Optional[bytes]:      
+        try:  
+            src_data = ensure_bytes(src_data)  
+            patch_data = ensure_bytes(patch_data)      
             
-            if patch_data.startswith(b'BSDIFF40'):    
-                result = apply_bsdiff_patch(src_data, patch_data)    
-            elif patch_data.startswith(b'IMGDIFF2'):    
-                logger.info(f"Processing IMGDIFF2 patch: size={len(patch_data)}, src_size={len(src_data)}")  
-                result = apply_imgdiff_patch_streaming(src_data, patch_data)    
-            else:    
-                logger.error(f"Unknown patch format: {patch_data[:8].hex()}")    
-                return None    
+            if isinstance(src_data, bytearray):      
+                src_data = bytes(src_data)      
+            
+            if patch_data.startswith(b'BSDIFF40'):      
+                result = apply_bsdiff_patch(src_data, patch_data)      
+            elif patch_data.startswith(b'IMGDIFF2'):      
+                logger.info(f"Processing IMGDIFF2 patch: size={len(patch_data)}, src_size={len(src_data)}")    
+                # 修复：传递bonus_data参数  
+                result = apply_imgdiff_patch_streaming(src_data, patch_data, None)      
+            else:      
+                logger.error(f"Unknown patch format: {patch_data[:8].hex()}")      
+                return None      
     
             # 验证目标哈希  
-            if expected_tgt_hash and expected_tgt_hash != "0" * 40:    
-                actual_hash = hashlib.sha1(result).hexdigest()    
-                if actual_hash != expected_tgt_hash:    
-                    logger.error(f"Target hash mismatch: expected {expected_tgt_hash}, got {actual_hash}")    
-                    return None    
+            if expected_tgt_hash and expected_tgt_hash != "0" * 40:      
+                actual_hash = hashlib.sha1(result).hexdigest()      
+                if actual_hash != expected_tgt_hash:      
+                    logger.error(f"Target hash mismatch: expected {expected_tgt_hash}, got {actual_hash}")      
+                    return None      
     
-            return result    
+            return result      
     
-        except Exception as e:    
-            logger.error(f"Failed to apply patch: {e}")    
+        except Exception as e:      
+            logger.error(f"Failed to apply patch: {e}")      
             return None
+
   
     def _estimate_target_size(self, patch_data: bytes, src_data_len: int) -> int:  
         """Estimate target file size based on patch header"""  
@@ -1040,22 +1137,22 @@ class BlockImageUpdate:
           
         return src_data_len  
   
-    def perform_command_stash(self, tokens: List[str], pos: int) -> int:    
-        """Stash blocks for later use with LRU cache management"""    
-        if pos + 1 >= len(tokens):    
-            logger.error("Missing stash id or range for stash")    
-            return -1    
+    def perform_command_stash(self, tokens: List[str]) -> int:  
+        """Stash blocks for later use with LRU cache management"""  
+        if len(tokens) < 3:  
+            logger.error("Missing stash id or range for stash")  
+            return -1  
+            
+        try:  
+            stash_id = tokens[1]  
+            rangeset = RangeSet(tokens[2])  
                 
-        try:    
-            stash_id = tokens[pos]    
-            rangeset = RangeSet(tokens[pos + 1])    
+            logger.info(f"Stashing {rangeset.size} blocks as {stash_id}")  
                 
-            logger.info(f"Stashing {rangeset.size} blocks as {stash_id}")    
-                
-            # Read blocks to stash    
-            stash_data = self._read_blocks(rangeset)    
-            if stash_data is None:    
-                return -1    
+            # Read blocks to stash  
+            stash_data = self._read_blocks(rangeset)  
+            if stash_data is None:  
+                return -1  
                 
             # Store in LRU cache (handles both memory and disk automatically)  
             self.stash_cache.put(stash_id, stash_data)  
@@ -1065,39 +1162,25 @@ class BlockImageUpdate:
                 stats = self.stash_cache.get_memory_usage()  
                 logger.debug(f"Stash cache stats: {stats}")  
                 
-            return 0    
+            return 0  
                 
-        except Exception as e:    
-            logger.error(f"Failed to stash blocks: {e}")    
+        except Exception as e:  
+            logger.error(f"Failed to stash blocks: {e}")  
             return -1
-
   
-    def perform_command_free(self, tokens: List[str], pos: int) -> int:    
-        """Free stashed data with LRU cache cleanup"""    
-        if pos >= len(tokens):    
-            logger.error("Missing stash id for free")    
-            return -1    
-                
-        stash_id = tokens[pos]    
+    def perform_command_free(self, tokens: List[str]) -> int:  
+        """Free stashed data with LRU cache cleanup"""  
+        if len(tokens) < 2:  
+            logger.error("Missing stash id for free")  
+            return -1  
+            
+        stash_id = tokens[1]  
         
         # Remove from LRU cache (handles both memory and disk)  
         self.stash_cache.remove(stash_id)  
         logger.info(f"Freed stash {stash_id}")  
             
         return 0
-
-  
-    def _read_blocks(self, rangeset: RangeSet) -> Optional[bytes]:  
-        """Read blocks with async optimization for large files"""  
-        try:  
-            # 对于大文件使用异步处理  
-            if self.large_file_config.enable_streaming and rangeset.size > 256:  # >1MB  
-                return asyncio.run(self._read_blocks_async(rangeset))  
-            else:  
-                return self._read_blocks_sync(rangeset)  
-        except Exception as e:  
-            logger.error(f"Failed to read blocks: {e}")  
-            return None  
     
     async def _read_blocks_async(self, rangeset: RangeSet) -> bytes:  
         """Async version of block reading"""  
@@ -1106,37 +1189,53 @@ class BlockImageUpdate:
         with self._open_block_device('rb') as f:  
             return await async_processor.read_blocks_async(f, rangeset)  
   
-    def _read_blocks_sync(self, rangeset: RangeSet) -> bytes:  
-        """Synchronous version optimized for memory constraints"""  
-        # For large ranges, use streaming approach  
-        if rangeset.size > 64:  # >256KB  
-            return self._read_blocks_streaming_sync(rangeset)  
+    def _read_blocks_sync(self, rangeset: RangeSet) -> bytes:
+        """Synchronous version optimized for memory constraints and Windows compatibility"""
+        # For large ranges, use streaming approach
+        if rangeset.size > 64:  # >256KB
+            return self._read_blocks_streaming_sync(rangeset)
         
-        data = bytearray()  
+        data = bytearray()
         
-        with self._open_block_device('rb') as f:  
-            for start_block, end_block in rangeset:  
-                f.seek(start_block * self.BLOCKSIZE)  
-                
-                # Process in very small chunks for memory constraint  
-                remaining_blocks = end_block - start_block  
-                while remaining_blocks > 0:  
-                    chunk_blocks = min(remaining_blocks, 16)  # Only 64KB at a time  
-                    chunk_size = chunk_blocks * self.BLOCKSIZE  
-                    
-                    chunk_data = read_bin_file(chunk_size)  
-                    if len(chunk_data) != chunk_size:  
-                        logger.error(f"Short read: expected {chunk_size}, got {len(chunk_data)}")  
-                        return None  
-                    
-                    data.extend(chunk_data)  
-                    remaining_blocks -= chunk_blocks  
-                    
-                    # Aggressive memory management every 16 blocks  
-                    if len(data) % (16 * self.BLOCKSIZE) == 0:  
-                        gc.collect()  
-        
+        try:
+            with open(self.blockdev_path, 'rb') as f:
+                for start_block, end_block in rangeset:
+                    f.seek(start_block * self.BLOCKSIZE)
+                    # Process in very small chunks for memory constraint
+                    remaining_blocks = end_block - start_block
+                    while remaining_blocks > 0:
+                        chunk_blocks = min(remaining_blocks, 16)  # Only 64KB at a time
+                        chunk_size = chunk_blocks * self.BLOCKSIZE
+                        
+                        chunk_data = f.read(chunk_size)
+                        if len(chunk_data) != chunk_size:
+                            logger.error(f"Short read: expected {chunk_size}, got {len(chunk_data)}")
+                            return None
+                        
+                        data.extend(chunk_data)
+                        remaining_blocks -= chunk_blocks
+                        
+                        # Aggressive memory management every 16 blocks
+                        if len(data) % (16 * self.BLOCKSIZE) == 0:
+                            gc.collect()
+        except WindowsError as e:
+            logger.error(f"Windows-specific file error: {e}")
+            # 重试一次
+            time.sleep(0.5)
+            try:
+                with open(self.blockdev_path, 'rb') as f:
+                    for start_block, end_block in rangeset:
+                        f.seek(start_block * self.BLOCKSIZE)
+                        data_slice = f.read((end_block - start_block) * self.BLOCKSIZE)
+                        data.extend(data_slice)
+            except Exception as retry_e:
+                logger.error(f"Retry failed: {retry_e}")
+                return None
+        except Exception as e:
+            logger.error(f"Failed to read blocks: {e}")
+            return None
         return bytes(data)
+
 
     def _read_blocks_streaming_sync(self, rangeset: RangeSet) -> bytes:  
         """Stream large block reads using temporary file to avoid memory pressure"""  
@@ -1170,19 +1269,6 @@ class BlockImageUpdate:
             # Clean up temp file  
             if temp_file.exists():  
                 temp_file.unlink()
-
-
-    def _write_blocks(self, rangeset: RangeSet, data: bytes) -> bool:  
-        """Write blocks with async optimization for large files"""  
-        try:  
-            # 对于大文件使用异步处理  
-            if self.large_file_config.enable_streaming and len(data) > 1024 * 1024:  # >1MB  
-                return asyncio.run(self._write_blocks_async(rangeset, data))  
-            else:  
-                return self._write_blocks_sync(rangeset, data)  
-        except Exception as e:  
-            logger.error(f"Failed to write blocks: {e}")  
-            return False  
     
     async def _write_blocks_async(self, rangeset: RangeSet, data: bytes) -> bool:  
         """Async version of block writing"""  
@@ -1581,21 +1667,19 @@ class BlockImageUpdate:
         return False  
   
     def _process_commands(self, start_line: int) -> int:  
-        """Process transfer list commands with integrated performance monitoring"""  
-        # 初始化性能监控  
-        self._initialize_performance_monitoring()  
-        
+        """Process transfer list commands with correct function signatures"""  
         commands = {  
             'zero': lambda tokens, pos: self._handle_zero_command(tokens, pos),  
-            'new': lambda tokens, pos: self.perform_command_new(tokens, pos),  
+            'new': lambda tokens, pos: self._handle_new_command(tokens, pos),  
             'erase': lambda tokens, pos: self._handle_erase_command(tokens, pos),  
-            'move': lambda tokens, pos: self.perform_command_move(tokens, pos),  
-            'bsdiff': lambda tokens, pos: self.perform_command_diff(tokens, pos, 'bsdiff'),  
-            'imgdiff': lambda tokens, pos: self.perform_command_diff(tokens, pos, 'imgdiff'),  
-            'stash': lambda tokens, pos: self.perform_command_stash(tokens, pos),  
-            'free': lambda tokens, pos: self.perform_command_free(tokens, pos),  
-        }  
-        
+            'move': lambda tokens, pos: self._handle_move_command(tokens, pos),  
+            'bsdiff': lambda tokens, pos: self.perform_command_diff(tokens, 'bsdiff'),  
+            'imgdiff': lambda tokens, pos: self.perform_command_diff(tokens, 'imgdiff'),  
+            'stash': lambda tokens, pos: self.perform_command_stash(tokens),  
+            'free': lambda tokens, pos: self.perform_command_free(tokens),  
+        }          
+        # 初始化性能监控  
+        self._initialize_performance_monitoring()  
         failed_command_counts = {}  
         total_failed = 0  
         
@@ -1674,24 +1758,24 @@ class BlockImageUpdate:
             self.failed_command_details = failed_command_counts  
         
         return total_failed  
-
-
-
   
     def _handle_zero_command(self, tokens: List[str], pos: int) -> int:  
         """Handle zero command with patch stream check"""  
         if self.patch_stream_empty:  
             logger.info("Skipping zero command...")  
             return 0  
-        return self.perform_command_zero(tokens, pos)  
-  
+        # 只传递 tokens，不传递 pos  
+        return self.perform_command_zero(tokens)
+
+    
     def _handle_erase_command(self, tokens: List[str], pos: int) -> int:  
         """Handle erase command with patch stream check"""  
         if self.patch_stream_empty:  
             logger.info("Skipping erase command...")  
             return 0  
-        return self.perform_command_zero(tokens, pos)  # Erase -> zero for compatibility  
-  
+        # 只传递 tokens，不传递 pos  
+        return self.perform_command_zero(tokens)  # Erase -> zero for compatibility
+
     def _update_and_save_progress(self, line_num: int, cmd: str):  
         """Update progress and save checkpoint if needed"""  
         if self._should_save_checkpoint(line_num, cmd):  
@@ -2627,48 +2711,6 @@ class BlockImageUpdate:
             logger.error(f"Failed to export performance metrics: {e}")  
             return {}
 
-
-  
-def main():  
-    """Main entry point"""  
-    if len(sys.argv) < 5:  
-        print(f"usage: {sys.argv[0]} <system.img> <system.transfer.list> <system.new.dat> <system.patch.dat> [--continue-on-error]")  
-        print("args:")  
-        print("\t- block device (or file) to modify in-place")  
-        print("\t- transfer list (blob)")  
-        print("\t- new data stream (filename within package.zip)")  
-        print("\t- patch stream (filename within package.zip, must be uncompressed)")  
-        print("\t--continue-on-error: continue execution even if commands fail")  
-        return 1  
-  
-    # 检查是否有continue-on-error参数  
-    continue_on_error = '--continue-on-error' in sys.argv  
-  
-    try:  
-        with BlockImageUpdate(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4],   
-                             continue_on_error=continue_on_error) as biu:  
-            result = biu.process_transfer_list()  
-  
-            if result == 0:  
-                print("Done")  
-            elif continue_on_error and result > 0:  
-                # 生成详细的失败命令报告  
-                if hasattr(biu, 'failed_command_details') and biu.failed_command_details:  
-                    failure_details = []  
-                    for cmd, count in sorted(biu.failed_command_details.items()):  
-                        failure_details.append(f"{cmd}*{count}")  
-                    failure_summary = " ".join(failure_details)  
-                    print(f"Done with {result} failed commands ({failure_summary}) (continued execution)")  
-                else:  
-                    print(f"Done with {result} failed commands (continued execution)")  
-            else:  
-                print(f"Done with error code: {result}")  
-  
-            return result  
-    except Exception as e:  
-        print(f"Fatal error: {e}")  
-        return -1
-
 class ErrorLogHandler:  
     log_file = 'errors.txt'  # Add this class attribute  
       
@@ -2756,8 +2798,6 @@ def main():
         return -1  
   
     return 0
-
-
   
 if __name__ == "__main__":  
     sys.exit(main())

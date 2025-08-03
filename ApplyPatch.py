@@ -6,6 +6,7 @@ import hashlib
 import struct  
 import tempfile  
 import shutil  
+import time
 import zlib  
 from typing import List, Optional, Tuple, Union, Iterator  
 import bsdiff4
@@ -25,22 +26,29 @@ class FileContents:
     """Represents file contents with SHA1 hash and metadata"""  
     __slots__ = ('data', 'sha1', 'file_path', 'st_mode', 'st_uid', 'st_gid')  
       
-    def __init__(self, data: bytes = b'', file_path: str = ''):  
+    def __init__(self, data: bytes, filename: str):  
+        """Initialize FileContents with Windows-safe operations"""  
         self.data = data  
-        self.sha1 = hashlib.sha1(data, usedforsecurity=False).digest() if data else b''  
-        self.file_path = file_path  
-        self.st_mode = 0o644  
-        self.st_uid = os.getuid() if hasattr(os, 'getuid') else 0  
-        self.st_gid = os.getgid() if hasattr(os, 'getgid') else 0  
-          
-        if file_path and os.path.exists(file_path):  
-            try:  
-                stat = os.stat(file_path)  
-                self.st_mode = stat.st_mode  
-                self.st_uid = stat.st_uid  
-                self.st_gid = stat.st_gid  
-            except (OSError, AttributeError):  
-                pass  # 使用默认值  
+        self.filename = filename  
+        self.sha1 = hashlib.sha1(data).digest()  
+        
+        # Windows-safe stat handling  
+        if os.name == 'nt':  
+            max_retries = 3  
+            for attempt in range(max_retries):  
+                try:  
+                    self.st = Path(filename).stat()  
+                    break  
+                except OSError as e:  
+                    if hasattr(e, 'winerror') and e.winerror == 6:  
+                        logger.warning(f"WinError 6 getting file stats, attempt {attempt + 1}")  
+                        if attempt < max_retries - 1:  
+                            time.sleep(0.1 * (attempt + 1))  
+                            continue  
+                    raise  
+        else:  
+            self.st = Path(filename).stat()
+
   
 # Constants for ImgDiff  
 CHUNK_NORMAL = 0  
@@ -60,13 +68,41 @@ def ensure_bytes(data):
         raise TypeError(f"Unsupported data type for patch: {type(data)}")
     
 # Cache path for cross-platform compatibility  
-def get_cache_temp_source():
-    if os.name == 'nt':
-        temp_dir = Path(tempfile.gettempdir()) / "applypatch_cache"
-    else:
-        temp_dir = Path("/tmp/applypatch_cache")
-    temp_dir.mkdir(parents=True, exist_ok=True)
+def get_cache_temp_source():  
+    """Windows-compatible cache path generation with WinError 6 handling"""  
+    if os.name == 'nt':  
+        # Use Windows temp directory with proper error handling  
+        temp_base = os.environ.get('TEMP', os.environ.get('TMP', 'C:\\temp'))  
+        temp_dir = Path(temp_base) / "applypatch_cache"  
+        # Ensure Windows path format  
+        temp_dir = Path(str(temp_dir).replace('/', '\\'))  
+    else:  
+        temp_dir = Path("/tmp/applypatch_cache")  
+      
+    max_retries = 3  
+    for attempt in range(max_retries):  
+        try:  
+            temp_dir.mkdir(parents=True, exist_ok=True)  
+            break  
+        except (PermissionError, OSError) as e:  
+            if os.name == 'nt' and hasattr(e, 'winerror') and e.winerror == 6:  
+                logger.warning(f"WinError 6 creating cache dir, attempt {attempt + 1}")  
+                if attempt < max_retries - 1:  
+                    time.sleep(0.2 * (attempt + 1))  
+                    # Try alternative temp location  
+                    import tempfile  
+                    temp_dir = Path(tempfile.gettempdir()) / f"ap_cache_{attempt}"  
+                    continue  
+            elif attempt == max_retries - 1:  
+                # Final fallback  
+                import tempfile  
+                temp_dir = Path(tempfile.gettempdir()) / "ap_cache_fallback"  
+                temp_dir.mkdir(parents=True, exist_ok=True)  
+            else:  
+                time.sleep(0.1)  
+      
     return temp_dir / "temp_source"
+
 CACHE_TEMP_SOURCE = get_cache_temp_source()
   
 @contextmanager  
@@ -222,52 +258,56 @@ def compress_deflate(data, level, window_bits, mem_level, strategy):
     compressor = zlib.compressobj(level=level, wbits=window_bits, memLevel=mem_level, strategy=strategy)
     return compressor.compress(data) + compressor.flush()
 
-def apply_imgdiff_patch_streaming(source_data: bytes, patch_data: bytes, bonus_data: bytes = None) -> bytes:  
-    """Apply ImgDiff patch with streaming for memory efficiency"""  
-      
-    if len(patch_data) < 12:  
-        raise ValueError("Patch too short to contain header")  
-      
-    if not patch_data.startswith(b'IMGDIFF2'):  
-        raise ValueError("Not an ImgDiff2 patch")  
-      
-    num_chunks = read_le_int32(patch_data, 8)  
-    pos = 12  
-      
-    if num_chunks <= 0 or num_chunks > 1000:  
-        raise ValueError(f"Invalid number of chunks: {num_chunks}")  
-      
-    # 使用BytesIO进行流式处理，减少内存使用  
-    output_stream = io.BytesIO()  
-      
-    for chunk_idx in range(num_chunks):  
-        if pos + 4 > len(patch_data):  
-            raise ValueError(f"Failed to read chunk {chunk_idx} record")  
-          
-        chunk_type = read_le_int32(patch_data, pos)  
-        pos += 4  
-          
-        # Process chunk and update position  
-        try:  
-            if chunk_type == CHUNK_NORMAL:  
-                chunk_data, pos = process_normal_chunk(chunk_idx, source_data, patch_data, pos)  
-            elif chunk_type == CHUNK_RAW:  
-                chunk_data, pos = process_raw_chunk(chunk_idx, patch_data, pos)  
-            elif chunk_type in (CHUNK_GZIP, CHUNK_DEFLATE):  
-                chunk_data, pos = process_compressed_chunk(chunk_idx, chunk_type, source_data, patch_data, pos, bonus_data)  
-            else:  
-                raise ValueError(f"Unknown chunk type: {chunk_type}")  
-              
-            if chunk_data is None:  
-                raise ValueError(f"Failed to process chunk {chunk_idx}: no data returned")  
-              
-            # 写入流而不是存储在列表中  
-            output_stream.write(chunk_data)  
-              
-        except Exception as e:  
-            raise ValueError(f"Failed to process chunk {chunk_idx}: {e}") from e  
-      
-    return output_stream.getvalue()  
+def apply_imgdiff_patch_streaming(src_data: bytes, patch_data: bytes, bonus_data: bytes = None) -> bytes:    
+    """Apply IMGDIFF2 patch with exact C++ implementation matching"""    
+    try:    
+        src_data = ensure_bytes(src_data)    
+        patch_data = ensure_bytes(patch_data)    
+            
+        if not patch_data.startswith(b'IMGDIFF2'):    
+            raise ValueError("Not a valid IMGDIFF2 patch")    
+            
+        if len(patch_data) < 12:    
+            raise ValueError("Patch too short")    
+            
+        # Read number of chunks (matches C++ Read4(header+8))    
+        num_chunks = struct.unpack('<I', patch_data[8:12])[0]    
+        pos = 12    
+            
+        result = bytearray()    
+        logger.debug(f"IMGDIFF2: {num_chunks} chunks, patch size: {len(patch_data)}")    
+            
+        for i in range(num_chunks):    
+            # Read chunk type (matches C++ Read4(patch->data + pos))    
+            if pos + 4 > len(patch_data):    
+                raise ValueError(f"Failed to read chunk {i} record")    
+                
+            chunk_type = struct.unpack('<I', patch_data[pos:pos+4])[0]    
+            pos += 4    
+                
+            logger.debug(f"Chunk {i}: type={chunk_type} at pos={pos-4}")    
+                
+            if chunk_type == CHUNK_NORMAL:  # 0  
+                chunk_data, pos = process_normal_chunk(i, src_data, patch_data, pos)  
+                result.extend(chunk_data)  
+                    
+            elif chunk_type == CHUNK_DEFLATE:  # 2  
+                chunk_data, pos = process_compressed_chunk(i, chunk_type, src_data, patch_data, pos, bonus_data)  
+                result.extend(chunk_data)  
+                    
+            elif chunk_type == CHUNK_RAW:  # 3  
+                chunk_data, pos = process_raw_chunk(i, patch_data, pos)  
+                result.extend(chunk_data)  
+                    
+            else:    
+                raise ValueError(f"patch chunk {i} is unknown type {chunk_type}")    
+            
+        logger.debug(f"IMGDIFF2 patch applied successfully. Final pos: {pos}, Result size: {len(result)}")    
+        return bytes(result)    
+            
+    except Exception as e:    
+        logger.error(f"IMGDIFF2 patch application failed: {e}")    
+        raise  
   
 def process_normal_chunk(chunk_idx: int, source_data: bytes, patch_data: bytes, pos: int) -> Tuple[bytes, int]:  
     """Process CHUNK_NORMAL with proper 64-bit integer handling"""  
@@ -292,115 +332,121 @@ def process_normal_chunk(chunk_idx: int, source_data: bytes, patch_data: bytes, 
     result = apply_bsdiff_patch(chunk_source, chunk_patch)  
     return result, pos + 24  
   
-def process_raw_chunk(chunk_idx: int, patch_data: bytes, pos: int) -> Tuple[bytes, int]:  
-    """Process CHUNK_RAW with correct length reading and validation"""  
-    if pos + 8 > len(patch_data):  
-        raise ValueError(f"Failed to read chunk {chunk_idx} raw header")  
-      
-    data_len = read_le_int64(patch_data, pos)  
-    pos += 8  
-      
-    # 添加数值验证  
-    if data_len < 0:  
-        raise ValueError(f"Invalid RAW chunk data length: {data_len} (negative)")  
-    if data_len > len(patch_data) - pos:  
-        raise ValueError(f"Invalid RAW chunk data length: {data_len} (exceeds remaining data {len(patch_data) - pos})")  
-    if data_len > 100 * 1024 * 1024:  # 100MB 限制  
-        raise ValueError(f"RAW chunk data too large: {data_len} bytes")  
-      
-    return patch_data[pos:pos + data_len], pos + data_len  
+def process_raw_chunk(chunk_idx: int, patch_data: bytes, pos: int) -> Tuple[bytes, int]:    
+    """Process CHUNK_RAW with correct 4-byte length reading"""    
+    if pos + 4 > len(patch_data):    
+        raise ValueError(f"Failed to read chunk {chunk_idx} raw header")    
+        
+    # 使用4字节长度，匹配C++实现  
+    data_len = struct.unpack('<I', patch_data[pos:pos+4])[0]  
+    pos += 4    
+        
+    # 添加数值验证    
+    if data_len < 0:    
+        raise ValueError(f"Invalid RAW chunk data length: {data_len} (negative)")    
+    if data_len > len(patch_data) - pos:    
+        raise ValueError(f"Invalid RAW chunk data length: {data_len} (exceeds remaining data {len(patch_data) - pos})")    
+    if data_len > 100 * 1024 * 1024:  # 100MB 限制    
+        raise ValueError(f"RAW chunk data too large: {data_len} bytes")    
+        
+    return patch_data[pos:pos + data_len], pos + data_len
   
-def process_compressed_chunk(chunk_idx: int, chunk_type: int, source_data: bytes,  
-                           patch_data: bytes, pos: int, bonus_data: bytes = None) -> Tuple[bytes, int]:  
-    """Process CHUNK_GZIP or CHUNK_DEFLATE with correct 64-bit integer handling"""  
-      
-    # 基础头部大小都是32字节 (4 * 8 bytes)  
-    base_header_size = 32  
-      
-    if pos + base_header_size > len(patch_data):  
-        raise ValueError(f"Failed to read chunk {chunk_idx} compressed header")  
-      
-    # 使用64位整数读取，与其他chunk处理保持一致  
-    src_start = read_le_int64(patch_data, pos)  
-    src_len = read_le_int64(patch_data, pos + 8)  
-    patch_offset = read_le_int64(patch_data, pos + 16)  
-    expanded_len = read_le_int64(patch_data, pos + 24)  
-      
-    # 验证参数  
-    if any(x < 0 for x in [src_start, src_len, patch_offset, expanded_len]):  
-        raise ValueError(f"Negative values in chunk {chunk_idx} compressed header")  
-      
-    # 对于 CHUNK_DEFLATE，读取额外的压缩参数  
-    compression_level = 6  
-    window_bits = -15  
-    mem_level = 8  
-    strategy = 0  
-      
-    actual_header_size = base_header_size  
-      
+def process_compressed_chunk(chunk_idx: int, chunk_type: int, source_data: bytes,    
+                           patch_data: bytes, pos: int, bonus_data: bytes = None) -> Tuple[bytes, int]:    
+    """Process CHUNK_GZIP or CHUNK_DEFLATE with correct implementation"""    
+        
+    # DEFLATE chunk header: 32 bytes base + 16 bytes compression params = 48 bytes total  
     if chunk_type == CHUNK_DEFLATE:  
-        # 检查是否有足够的数据读取额外参数  
-        if pos + 48 <= len(patch_data):  # 32 + 16 = 48字节  
-            level = read_le_int32(patch_data, pos + 32)  
-            window_bits_raw = read_le_int32(patch_data, pos + 36)  
-            mem_level_raw = read_le_int32(patch_data, pos + 40)  
-            strategy_raw = read_le_int32(patch_data, pos + 44)  
-              
-            # 验证参数范围  
-            if 0 <= level <= 9:  
-                compression_level = level  
-            if -15 <= window_bits_raw <= 15:  
-                window_bits = window_bits_raw  
-            if 1 <= mem_level_raw <= 9:
-                mem_level = mem_level_raw  
-            if 0 <= strategy_raw <= 4:  
-                strategy = strategy_raw  
-              
-            actual_header_size = 48  
-        else:  
-            # 如果没有足够数据，使用默认值  
-            logger.warning(f"DEFLATE chunk {chunk_idx} missing compression parameters, using defaults")  
+        header_size = 48  
+    else:  
+        header_size = 32  
+          
+    if pos + header_size > len(patch_data):    
+        raise ValueError(f"Failed to read chunk {chunk_idx} compressed header")    
+        
+    # 读取基础参数 (32字节)  
+    src_start = struct.unpack('<Q', patch_data[pos:pos+8])[0]  
+    src_len = struct.unpack('<Q', patch_data[pos+8:pos+16])[0]    
+    patch_offset = struct.unpack('<Q', patch_data[pos+16:pos+24])[0]  
+    expanded_len = struct.unpack('<Q', patch_data[pos+24:pos+32])[0]  
+        
+    # 验证参数    
+    if any(x < 0 for x in [src_start, src_len, patch_offset, expanded_len]):    
+        raise ValueError(f"Negative values in chunk {chunk_idx} compressed header")    
+        
+    # 对于 CHUNK_DEFLATE，读取额外的压缩参数    
+    compression_level = 6    
+    window_bits = -15    
+    mem_level = 8    
+    strategy = 0    
       
-    if src_start + src_len > len(source_data):  
-        raise ValueError(f"Source parameters out of range: start={src_start}, len={src_len}")  
-      
-    if patch_offset >= len(patch_data):  
-        raise ValueError(f"Patch offset {patch_offset} out of range")  
-      
-    compressed_source = source_data[src_start:src_start + src_len]  
-      
-    # 解压缩源数据  
-    try:  
-        if chunk_type == CHUNK_GZIP:  
-            uncompressed_source = zlib.decompress(compressed_source, 16 + zlib.MAX_WBITS)  
-        else:  # CHUNK_DEFLATE  
-            try:  
-                uncompressed_source = zlib.decompress(compressed_source, window_bits)  
-            except zlib.error:  
-                uncompressed_source = zlib.decompress(compressed_source, -zlib.MAX_WBITS)  
-    except zlib.error as e:  
-        raise ValueError(f"Failed to decompress chunk {chunk_idx}: {e}")  
-      
-    # 处理 bonus data  
-    uncompressed_source = patch_with_bonus(uncompressed_source, bonus_data, expanded_len, chunk_idx)
-
-    # 应用 bsdiff 补丁  
-    chunk_patch = patch_data[patch_offset:]  
-    patched_uncompressed = apply_bsdiff_patch(uncompressed_source, chunk_patch)  
-      
-    # 重新压缩  
-    try:  
-        if chunk_type == CHUNK_GZIP:  
-            result = zlib.compress(patched_uncompressed, level=compression_level, wbits=16 + zlib.MAX_WBITS)  
-        else:  # CHUNK_DEFLATE  
-            # 使用读取的压缩参数  
-            compressor = uncompressed_source(level=compression_level, wbits=window_bits,  
-                                        memLevel=mem_level, strategy=strategy)  
-            result = compressor.compress(patched_uncompressed) + compressor.flush()  
-    except zlib.error as e:  
-        raise ValueError(f"Failed to recompress chunk {chunk_idx}: {e}")  
-      
-    return result, pos + actual_header_size  
+    pos += 32  # 移动到压缩参数位置  
+        
+    if chunk_type == CHUNK_DEFLATE:    
+        # 读取压缩参数 (16字节)  
+        level = struct.unpack('<I', patch_data[pos:pos+4])[0]  
+        method = struct.unpack('<I', patch_data[pos+4:pos+8])[0]  # 通常是Z_DEFLATED (8)  
+        window_bits_raw = struct.unpack('<I', patch_data[pos+8:pos+12])[0]  
+        mem_level_raw = struct.unpack('<I', patch_data[pos+12:pos+16])[0]  
+        strategy_raw = struct.unpack('<I', patch_data[pos+16:pos+20])[0]  
+        pos += 20  # 实际上C++代码读取了5个int32，所以是20字节  
+            
+        # 验证参数范围    
+        if 0 <= level <= 9:    
+            compression_level = level    
+        if -15 <= window_bits_raw <= 15:    
+            window_bits = window_bits_raw    
+        if 1 <= mem_level_raw <= 9:  
+            mem_level = mem_level_raw    
+        if 0 <= strategy_raw <= 4:    
+            strategy = strategy_raw    
+        
+    if src_start + src_len > len(source_data):    
+        raise ValueError(f"Source parameters out of range: start={src_start}, len={src_len}")    
+        
+    if patch_offset >= len(patch_data):    
+        raise ValueError(f"Patch offset {patch_offset} out of range")    
+        
+    compressed_source = source_data[src_start:src_start + src_len]    
+        
+    # 解压缩源数据    
+    try:    
+        if chunk_type == CHUNK_GZIP:    
+            uncompressed_source = zlib.decompress(compressed_source, 16 + zlib.MAX_WBITS)    
+        else:  # CHUNK_DEFLATE    
+            try:    
+                uncompressed_source = zlib.decompress(compressed_source, window_bits)    
+            except zlib.error:    
+                uncompressed_source = zlib.decompress(compressed_source, -zlib.MAX_WBITS)    
+    except zlib.error as e:    
+        raise ValueError(f"Failed to decompress chunk {chunk_idx}: {e}")    
+        
+    # 处理 bonus data (匹配C++实现)  
+    if bonus_data and expanded_len > len(uncompressed_source):  
+        bonus_size = expanded_len - len(uncompressed_source)  
+        if bonus_size <= len(bonus_data):  
+            uncompressed_source = bytearray(uncompressed_source)  
+            uncompressed_source.extend(bonus_data[:bonus_size])  
+            uncompressed_source = bytes(uncompressed_source)  
+            logger.debug(f"Applied {bonus_size} bytes of bonus data to chunk {chunk_idx}")  
+  
+    # 应用 bsdiff 补丁    
+    chunk_patch = patch_data[patch_offset:]    
+    patched_uncompressed = apply_bsdiff_patch(uncompressed_source, chunk_patch)    
+        
+    # 重新压缩    
+    try:    
+        if chunk_type == CHUNK_GZIP:    
+            result = zlib.compress(patched_uncompressed, level=compression_level, wbits=16 + zlib.MAX_WBITS)    
+        else:  # CHUNK_DEFLATE    
+            # 修复：使用正确的zlib.compressobj调用  
+            compressor = zlib.compressobj(level=compression_level, wbits=window_bits,    
+                                        memLevel=mem_level, strategy=strategy)    
+            result = compressor.compress(patched_uncompressed) + compressor.flush()    
+    except zlib.error as e:    
+        raise ValueError(f"Failed to recompress chunk {chunk_idx}: {e}")    
+        
+    return result, pos  
   
 def sanitize_filename(filename: str) -> str:  
     """Sanitize filename for cross-platform compatibility"""  
