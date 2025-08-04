@@ -29,6 +29,15 @@ import gc      # 垃圾回收控制
 
 logger = logging.getLogger("BlockImageUpdate")
 
+# ---------------------------------------------------------------------------
+# Constants for IMGDIFF2
+# ---------------------------------------------------------------------------
+CHUNK_NORMAL   = 0
+CHUNK_GZIP     = 1
+CHUNK_DEFLATE  = 2
+CHUNK_RAW      = 3
+CHUNK_COMPRESSED_BSDIFF  = 8   # 新增：标识“compressed bsdiff”块
+
 def read_bin_file(filename):
     with open(filename, 'rb') as f:
         return f.read()
@@ -1084,38 +1093,49 @@ class BlockImageUpdate:
             data_offset += length
         return True
   
-    def _apply_patch_internal(self, src_data: bytes, patch_data: bytes,       
-                            cmd_name: str, expected_tgt_hash: str) -> Optional[bytes]:      
-        try:  
-            src_data = ensure_bytes(src_data)  
-            patch_data = ensure_bytes(patch_data)      
-            
-            if isinstance(src_data, bytearray):      
-                src_data = bytes(src_data)      
-            
-            if patch_data.startswith(b'BSDIFF40'):      
-                result = apply_bsdiff_patch(src_data, patch_data)      
-            elif patch_data.startswith(b'IMGDIFF2'):      
-                logger.info(f"Processing IMGDIFF2 patch: size={len(patch_data)}, src_size={len(src_data)}")    
-                # 修复：传递bonus_data参数  
-                result = apply_imgdiff_patch_streaming(src_data, patch_data, None)      
-            else:      
-                logger.error(f"Unknown patch format: {patch_data[:8].hex()}")      
-                return None      
-    
-            # 验证目标哈希  
-            if expected_tgt_hash and expected_tgt_hash != "0" * 40:      
-                actual_hash = hashlib.sha1(result).hexdigest()      
-                if actual_hash != expected_tgt_hash:      
-                    logger.error(f"Target hash mismatch: expected {expected_tgt_hash}, got {actual_hash}")      
-                    return None      
-    
-            return result      
-    
-        except Exception as e:      
-            logger.error(f"Failed to apply patch: {e}")      
-            return None
+    def _apply_patch_internal(self,
+                            src_data: bytes,
+                            patch_data: bytes,
+                            cmd_name: str,
+                            expected_tgt_hash: str) -> Optional[bytes]:
+        try:
+            # ensure raw bytes
+            src = ensure_bytes(src_data)
+            pd  = ensure_bytes(patch_data)
+            if isinstance(src, bytearray):
+                src = bytes(src)
 
+            # BSDIFF shortcut
+            if pd.startswith(b'BSDIFF40'):
+                result = apply_bsdiff_patch(src, pd)
+
+            # IMGDIFF2 with possible bonus_data for chunk 8
+            elif pd.startswith(b'IMGDIFF2'):
+                logger.info(
+                    f"Processing IMGDIFF2 patch: "
+                    f"patch_len={len(pd)}, src_len={len(src)}"
+                )
+                # Let ApplyPatch.py parse all chunks (including type 8) itself:
+                result = apply_imgdiff_patch_streaming(src_data,patch_data,None)
+            
+            else:
+                logger.error(f"Unknown patch format: {pd[:8].hex()}")
+                return None
+
+            # verify result hash if expected
+            if expected_tgt_hash and expected_tgt_hash != '0' * 40:
+                actual = hashlib.sha1(result).hexdigest()
+                if actual != expected_tgt_hash:
+                    logger.error(
+                        f"Target hash mismatch: expected={expected_tgt_hash}, got={actual}"
+                    )
+                    return None
+
+            return result
+
+        except Exception as e:
+            logger.error(f"Failed to apply patch: {e}", exc_info=True)
+            return None
   
     def _estimate_target_size(self, patch_data: bytes, src_data_len: int) -> int:  
         """Estimate target file size based on patch header"""  
