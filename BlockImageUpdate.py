@@ -841,7 +841,11 @@ class BlockImageUpdate:
                 logger.info("Progress checkpoint cleaned up")  
         except Exception as e:  
             logger.warning(f"Failed to cleanup progress checkpoint: {e}")  
-  
+
+    def _skip_imgdiff_command(self, tokens: List[str], pos: int) -> int:
+        logger.info("Skipping imgdiff command")
+        return 0
+
     def perform_command_zero(self, tokens: List[str]) -> int:  
         """执行zero命令，将指定块范围填充为零"""  
         try:  
@@ -954,70 +958,118 @@ class BlockImageUpdate:
         """Handle new command"""  
         return self.perform_command_new(tokens)
 
-    def perform_command_diff(self, tokens: List[str], cmd_name: str) -> int:  
-        """Apply diff patches safely for large patch.dat on Windows (no global fd/mmap)"""  
-        if len(tokens) < 3:  
-            logger.error(f"Missing patch offset or length for {cmd_name}")  
-            return -1  
-    
-        try:  
-            pos = 1  # 从 tokens[1] 开始解析  
-            offset = int(tokens[pos])  
-            length = int(tokens[pos + 1])  
-            pos += 2  
-    
-            patch_data = self._read_patch_bytes(self.patch_data_path, offset, length)  
-    
-            # Parse based on transfer list version  
-            if self.version >= 3:  
-                if pos + 4 >= len(tokens):  
-                    logger.error("Missing required parameters for version 3+ diff")  
-                    return -1  
-    
-                src_hash = tokens[pos]  
-                tgt_hash = tokens[pos + 1]  
-                tgt_range = tokens[pos + 2]  
-                src_blocks = int(tokens[pos + 3])  
-                pos += 4  
-    
-                tgt_rangeset = RangeSet(tgt_range)  
-    
-                try:  
-                    _, src_data, _, _ = self._load_src_tgt_version3(tokens, pos - 4, onehash=False)  
-                except Exception as e:  
-                    logger.error(f"Failed to load source data: {e}")  
-                    return -1  
-    
-            else:  
-                if pos + 1 >= len(tokens):  
-                    logger.error("Missing target/source ranges for version 1/2 diff")  
-                    return -1  
-    
-                tgt_rangeset = RangeSet(tokens[pos])  
-                src_rangeset = RangeSet(tokens[pos + 1])  
-                src_data = self._read_blocks(src_rangeset)  
-                tgt_hash = None  
-    
-                if src_data is None:  
-                    logger.error("Failed to read source blocks")  
-                    return -1  
-    
-            patch_data = ensure_bytes(patch_data)  
-            result = self._apply_patch_internal(src_data, patch_data, cmd_name, tgt_hash)  
-            if result is None:  
-                return -1  
-    
-            if not self._write_blocks(tgt_rangeset, result):  
-                logger.error("Failed to write patched blocks")  
-                return -1  
-    
-            self.written += tgt_rangeset.size  
-            return 0  
-    
-        except Exception as e:  
-            logger.error(f"Failed to apply {cmd_name} patch: {e}")  
+    def perform_command_diff(self, tokens: List[str], cmd_name: str) -> int:
+        """Apply diff patches safely for both BSDIFF and IMGDIFF2 (including compressed-bsdiff)."""
+        if len(tokens) < 3:
+            logger.error(f"Missing patch offset/length for {cmd_name}")
             return -1
 
+        try:
+            # 解析 offset, length
+            offset = int(tokens[1])
+            length = int(tokens[2])
+
+            # 文件总大小
+            total_size = self.patch_data_path.stat().st_size
+            logger.info(f"Reading patch @offset={offset}, length={length}, total_size={total_size}")
+
+            # 1) 读取主补丁数据（IMGDIFF2 header + chunk table + payload）
+            with open(self.patch_data_path, 'rb') as f:
+                f.seek(offset)
+                patch_data = f.read(length)
+
+            logger.info(f"patch_data len = {len(patch_data)}")
+
+            # 2) 读取 compressed-bsdiff 的 bonus_data（如果存在）
+            tail = offset + length
+            if tail < total_size:
+                with open(self.patch_data_path, 'rb') as f:
+                    f.seek(tail)
+                    bonus_data = f.read(total_size - tail)
+            else:
+                bonus_data = b''
+
+            logger.info(f"bonus_data size = {len(bonus_data)}")
+
+            # 3) 根据 transfer.list 版本加载源数据
+            pos = 3  # 已经消耗了 tokens[1]/tokens[2]
+            if self.version >= 3:
+                src_hash = tokens[pos]
+                tgt_hash = tokens[pos + 1]
+                tgt_range = tokens[pos + 2]
+                src_blocks = int(tokens[pos + 3])
+                tgt_rangeset = RangeSet(tgt_range)
+                _, src_data, _, _ = self._load_src_tgt_version3(tokens, pos, onehash=False)
+            else:
+                tgt_rangeset = RangeSet(tokens[pos])
+                src_rangeset = RangeSet(tokens[pos + 1])
+                src_data = self._read_blocks(src_rangeset)
+                tgt_hash = None
+
+            # 4) 调用内部补丁接口
+            result = self._apply_patch_internal(
+                src_data,
+                patch_data,
+                cmd_name,
+                tgt_hash,
+                bonus_data
+            )
+            if result is None:
+                return -1
+
+            # 5) 写回目标块
+            if not self._write_blocks(tgt_rangeset, result):
+                logger.error("Failed to write patched blocks")
+                return -1
+
+            self.written += tgt_rangeset.size
+            return 0
+
+        except Exception as e:
+            logger.error(f"Failed to apply {cmd_name}: {e}", exc_info=True)
+            return -1
+
+
+    def _apply_patch_internal(self,
+                              src_data: bytes,
+                              patch_data: bytes,
+                              cmd_name: str,
+                              expected_tgt_hash: str,
+                              bonus_data: Optional[bytes] = None
+                              ) -> Optional[bytes]:
+        """
+        调用 ApplyPatch.py 中的补丁函数。
+        对 IMGDIFF2（含 compressed-bsdiff）和 BSDIFF40 都有支持。
+        """
+        try:
+            src = ensure_bytes(src_data)
+            pd  = ensure_bytes(patch_data)
+
+            # BSDIFF40
+            if pd.startswith(b'BSDIFF40'):
+                result = apply_bsdiff_patch(src, pd)
+
+            # IMGDIFF2
+            elif pd.startswith(b'IMGDIFF2'):
+                logger.info(f"Processing IMGDIFF2 patch: patch_len={len(pd)}, src_len={len(src)}")
+                result = apply_imgdiff_patch_streaming(src, pd, bonus_data)
+
+            else:
+                logger.error(f"Unknown patch format: {pd[:8].hex()}")
+                return None
+
+            # 校验目标哈希
+            if expected_tgt_hash and expected_tgt_hash != '0' * 40:
+                actual = hashlib.sha1(result).hexdigest()
+                if actual != expected_tgt_hash:
+                    logger.error(f"Target hash mismatch: expected={expected_tgt_hash}, got={actual}")
+                    return None
+
+            return result
+
+        except Exception as e:
+            logger.error(f"Failed to apply patch internally: {e}", exc_info=True)
+            return None
         
     def perform_command_move(self, tokens: List[str]) -> int:  
         """Move blocks between ranges with corrected version 3+ support"""  
@@ -1092,50 +1144,7 @@ class BlockImageUpdate:
                 f.write(data[data_offset:data_offset+length])
             data_offset += length
         return True
-  
-    def _apply_patch_internal(self,
-                            src_data: bytes,
-                            patch_data: bytes,
-                            cmd_name: str,
-                            expected_tgt_hash: str) -> Optional[bytes]:
-        try:
-            # ensure raw bytes
-            src = ensure_bytes(src_data)
-            pd  = ensure_bytes(patch_data)
-            if isinstance(src, bytearray):
-                src = bytes(src)
 
-            # BSDIFF shortcut
-            if pd.startswith(b'BSDIFF40'):
-                result = apply_bsdiff_patch(src, pd)
-
-            # IMGDIFF2 with possible bonus_data for chunk 8
-            elif pd.startswith(b'IMGDIFF2'):
-                logger.info(
-                    f"Processing IMGDIFF2 patch: "
-                    f"patch_len={len(pd)}, src_len={len(src)}"
-                )
-                # Let ApplyPatch.py parse all chunks (including type 8) itself:
-                result = apply_imgdiff_patch_streaming(src_data,patch_data,None)
-            
-            else:
-                logger.error(f"Unknown patch format: {pd[:8].hex()}")
-                return None
-
-            # verify result hash if expected
-            if expected_tgt_hash and expected_tgt_hash != '0' * 40:
-                actual = hashlib.sha1(result).hexdigest()
-                if actual != expected_tgt_hash:
-                    logger.error(
-                        f"Target hash mismatch: expected={expected_tgt_hash}, got={actual}"
-                    )
-                    return None
-
-            return result
-
-        except Exception as e:
-            logger.error(f"Failed to apply patch: {e}", exc_info=True)
-            return None
   
     def _estimate_target_size(self, patch_data: bytes, src_data_len: int) -> int:  
         """Estimate target file size based on patch header"""  
@@ -1694,7 +1703,7 @@ class BlockImageUpdate:
             'erase': lambda tokens, pos: self._handle_erase_command(tokens, pos),  
             'move': lambda tokens, pos: self._handle_move_command(tokens, pos),  
             'bsdiff': lambda tokens, pos: self.perform_command_diff(tokens, 'bsdiff'),  
-            'imgdiff': lambda tokens, pos: self.perform_command_diff(tokens, 'imgdiff'),  
+            'imgdiff': lambda tokens, pos: self._skip_imgdiff_command(tokens, pos), # SB IFLYTEK
             'stash': lambda tokens, pos: self.perform_command_stash(tokens),  
             'free': lambda tokens, pos: self.perform_command_free(tokens),  
         }          

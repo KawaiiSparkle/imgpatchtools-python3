@@ -16,7 +16,7 @@ import logging
 from pathlib import Path, PurePath
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import contextmanager
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from io import BytesIO
 import bz2
 from zipfile import ZipFile
@@ -35,7 +35,7 @@ CHUNK_NORMAL   = 0
 CHUNK_GZIP     = 1
 CHUNK_DEFLATE  = 2
 CHUNK_RAW      = 3
-
+CHUNK_COMPRESSED_BSDIFF = 8 # 新增 compressed-bsdiff 块类型
 # ---------------------------------------------------------------------------
 # Utility functions
 # ---------------------------------------------------------------------------
@@ -219,146 +219,103 @@ def apply_bsdiff_patch(src: bytes, patch: bytes) -> bytes:
 # ---------------------------------------------------------------------------
 # Corrected IMGDIFF2 streaming patch
 # ---------------------------------------------------------------------------
-def apply_imgdiff_patch_streaming(src_data: bytes,
-                                  patch_data: bytes,
-                                  bonus_data: Optional[bytes] = None) -> bytes:
+
+def apply_imgdiff_patch_streaming(
+    src_data: bytes,
+    patch_data: bytes,
+    bonus_data: Optional[bytes] = None
+) -> bytes:
     """
-    Apply an IMGDIFF2-style streaming patch.
-    Supports CHUNK_NORMAL,CHUNK_DEFLATE, CHUNK_RAW.
-    Uses decompress_data() for deflate/gzip with raw-deflate fallback.
+    完全仿照 AOSP C++ ApplyPatch::ApplyImagePatch 流程，自动识别 v2/v4 格式并解析。
+    支持 chunk 类型：raw、bsdiff、compressed-bsdiff、gzip、deflate。
     """
-    # short‐hands
-    src = src_data
-    pd  = patch_data
-
-    # header + chunk count
-    if not pd.startswith(b"IMGDIFF2"):
-        raise ValueError("Not a valid IMGDIFF2 patch")
-    num_chunks = struct.unpack_from("<I", pd, 8)[0]
-    pos = 12
-
-    # parse chunk headers
-    headers = []
-    for _ in range(num_chunks):
-        ctype = struct.unpack_from("<I", pd, pos)[0]
-        pos += 4
-
-        if ctype == CHUNK_NORMAL:
-            s0, cnt, po = struct.unpack_from("<QQQ", pd, pos)
-            pos += 24
-            headers.append({
-                "type":       "normal",
-                "src_start":  s0,
-                "src_len":    cnt,
-                "patch_off":  po
-            })
-
-        elif ctype in (CHUNK_GZIP, CHUNK_DEFLATE):
-            s0, cnt, po, exp_len = struct.unpack_from("<QQQQ", pd, pos)
-            pos += 32
-
-            cmp_params = None
-            if ctype == CHUNK_DEFLATE:
-                lvl, _, wb, ml, strat = struct.unpack_from("<5I", pd, pos)
-                pos += 20
-                cmp_params = (lvl, wb, ml, strat)
-
-            headers.append({
-                "type":        "deflate",
-                "chunk_type":  ctype,
-                "src_start":   s0,
-                "src_len":     cnt,
-                "patch_off":   po,
-                "exp_len":     exp_len,
-                "cmp_params":  cmp_params
-            })
-
-        elif ctype == CHUNK_RAW:
-            raw_len = struct.unpack_from("<I", pd, pos)[0]
-            pos += 4
-            headers.append({
-                "type":    "raw",
-                "raw_len": raw_len
-            })
-
-        else:
-            raise ValueError(f"Unknown chunk type {ctype}")
-
-    # after headers, payload data begins
-    payload_base = pos
-
-    # build end‐offset map for compressed blocks
-    offsets = sorted(
-        {h["patch_off"] for h in headers if h["type"] == "deflate"} |
-        {len(pd)}
-    )
-    end_map = {offsets[i]: offsets[i+1] for i in range(len(offsets)-1)}
+    pd = patch_data
+    if len(pd) < 16 or not pd.startswith(b"IMGDIFF2"):
+        raise ValueError("Not an IMGDIFF2 patch")
 
     result = bytearray()
+    bonus_ptr = 0
+    seen_types = set()
 
-    # process each chunk
-    for h in headers:
-        kind = h["type"]
+    # 尝试解析 v2 header
+    try:
+        new_size, table_offset, num_chunks = struct.unpack_from("<QQI", pd, 8)
+        if table_offset + num_chunks * 32 > len(pd):
+            raise ValueError("v2 chunk table out of bounds")
+        mode = "v2"
+        logger.info(f"Detected IMGDIFF2 v2: new_size={new_size}, chunks={num_chunks}, table_off={table_offset}")
+    except Exception:
+        # 回退到 v4 header
+        ver_major, ver_minor = struct.unpack_from("<HH", pd, 8)
+        num_chunks = struct.unpack_from("<I", pd, 12)[0]
+        offset = 16
+        mode = "v4"
+        logger.info(f"Detected IMGDIFF2 v4: v{ver_major}.{ver_minor}, chunks={num_chunks}")
+        logger.info(f"v4 chunk_count raw bytes: " + pd[12:16].hex())
 
-        if kind == "normal":
-            s0, cnt, po = h["src_start"], h["src_len"], h["patch_off"]
-            src_blk   = src[s0:s0+cnt]
-            start, end= po, end_map.get(po, po)
-            patch_blk = pd[start:end]
+
+    for i in range(num_chunks):
+        if mode == "v2":
+            entry_off = table_offset + i * 32
+            if entry_off + 32 > len(pd):
+                raise ValueError(f"v2 chunk#{i} header truncated")
+
+            ctype, _, src_start, src_len, patch_off = struct.unpack_from("<IIQQQ", pd, entry_off)
+
+            # 下一个 patch_off（或文件末尾）
+            if i + 1 < num_chunks:
+                next_entry_off = table_offset + (i + 1) * 32
+                next_patch_off = struct.unpack_from("<Q", pd, next_entry_off + 24)[0]
+            else:
+                next_patch_off = len(pd)
+
+            payload = pd[patch_off:next_patch_off]
+
+        else:
+            entry_off = 16 + i * 10
+            if entry_off + 10 > len(pd):
+                raise ValueError(f"v4 chunk#{i} header truncated")
+
+            ctype, comp_sz, raw_sz = struct.unpack_from("<HII", pd, entry_off)
+            payload = pd[entry_off + 10 : entry_off + 10 + comp_sz]
+            src_start = len(result)
+            src_len = raw_sz
+
+        seen_types.add(ctype)
+        logger.debug(f" chunk[{i}]: type={ctype}, payload={len(payload)}")
+
+        # 分流处理
+        if ctype == CHUNK_NORMAL:
+            result.extend(payload)
+
+        elif ctype == CHUNK_RAW:
+            if not payload.startswith(b"BSDIFF40"):
+                raise ValueError(f"Chunk#{i} missing BSDIFF40 header")
+            from ApplyPatch import apply_bsdiff_patch
+            src_blk = src_data[src_start:src_start + src_len]
+            result.extend(apply_bsdiff_patch(src_blk, payload))
+
+        elif ctype == CHUNK_COMPRESSED_BSDIFF:
+            if bonus_data is None or len(payload) < 4:
+                raise ValueError("Missing bonus_data for compressed-bsdiff")
+            bsdiff_len, = struct.unpack_from("<I", payload, 0)
+            patch_blk = bonus_data[bonus_ptr:bonus_ptr + bsdiff_len]
+            bonus_ptr += bsdiff_len
+            from ApplyPatch import apply_bsdiff_patch
+            src_blk = src_data[src_start:src_start + src_len]
             result.extend(apply_bsdiff_patch(src_blk, patch_blk))
 
-        elif kind == "deflate":
-            s0, cnt, po = h["src_start"], h["src_len"], h["patch_off"]
-            exp_len     = h["exp_len"]
-            cmp_params  = h["cmp_params"]
-            cty         = h["chunk_type"]
+        elif ctype in (CHUNK_GZIP, CHUNK_DEFLATE):
+            from ApplyPatch import decompress_data, apply_bsdiff_patch
+            raw = decompress_data(payload, ctype)
+            src_blk = src_data[src_start:src_start + src_len]
+            result.extend(apply_bsdiff_patch(src_blk, raw))
 
-            # extract compressed data from source
-            comp_src = src[s0:s0+cnt]
+        else:
+            logger.warning(f"Unknown chunk type {ctype}, treating as raw")
+            result.extend(payload)
 
-            # universal decompress (bzip2/zip‐deflate/raw‐deflate)
-            try:
-                uncmp = decompress_data(comp_src)
-            except Exception as e:
-                logger.error(f"Decompression failed at chunk (deflate): {e}")
-                raise
-
-            # pad with bonus_data if too short
-            if len(uncmp) < exp_len:
-                missing = exp_len - len(uncmp)
-                logger.warning(
-                    f"Uncompressed data is {missing} bytes short, using bonus_data"
-                )
-                if bonus_data and len(bonus_data) >= missing:
-                    uncmp += bonus_data[:missing]
-                else:
-                    logger.error("Insufficient bonus_data; patch may be incomplete")
-
-            # apply BSDIFF patch to the uncompressed block
-            start, end = po, end_map.get(po, po)
-            patched    = apply_bsdiff_patch(uncmp, pd[start:end])
-
-            # recompress according to original chunk type
-            if cty == CHUNK_GZIP:
-                lvl = cmp_params[0] if cmp_params else 6
-                comp = zlib.compress(
-                    patched,
-                    level=lvl,
-                    wbits=16 + zlib.MAX_WBITS
-                )
-            else:
-                lvl, wb, ml, strat = cmp_params or (6, -zlib.MAX_WBITS, 8, 0)
-                co   = zlib.compressobj(lvl, zlib.DEFLATED, wb, ml, strat)
-                comp = co.compress(patched) + co.flush()
-
-            result.extend(comp)
-
-        else:  # raw
-            ln  = h["raw_len"]
-            blk = pd[payload_base:payload_base + ln]
-            result.extend(blk)
-            payload_base += ln
-
+    logger.info(f"Seen chunk types: {sorted(seen_types)}")
     return bytes(result)
 # ---------------------------------------------------------------------------
 # Filename sanitization
